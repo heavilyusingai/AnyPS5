@@ -18,6 +18,7 @@
 ### Unknown function info
 
 - [sceImeSetCaret and sceImeSetText](../../../core/libs/prx/libSceIme/Export.cpp) (libSceIme) - the PS5's response to a caret index within a UTF-16 surrogate pair, or to replacement text crossing the previous caret, is unmeasured. The host text path advances such a caret past the pair, following the existing text-filter normalization so later typing cannot split a valid character.
+- [sceImeOpen and sceImeSetCaret](../../../core/libs/prx/libSceIme/Export.cpp) (libSceIme) - the Param, ExtendedParam and Caret structures and the initial text are read through checked guest copies with the caller's `errno` preserved, the text unit by unit, so a string that ends before unreadable memory still opens; an unreadable structure or buffer returns `0x80bc0031` instead of faulting the host. Console behaviour for an unmapped pointer is unmeasured. `sceImeSetText` still reads its text directly
 
 - [sceImeVshOpen](../../../core/libs/prx/libSceIme/Export.cpp) (libSceIme) - VSH context, UTF-16 text and dictionary argument registers are recovered. The VSH parameter is copied as 256 bytes; preedit metadata is eight bytes. Dictionary operations transfer 224-byte records, with a fixed 11200-byte output for GetWords; the 64-bit dictionary selector and record fields still need receiver-side identification. These payload types remain incomplete. UpdateTextInfo and RemoteEventParam use the existing 64-byte ImeEditText and event payload at offset eight; their byte-sized repair flag permits correcting invalid text ranges and caret positions.
 

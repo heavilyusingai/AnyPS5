@@ -3,6 +3,7 @@
 #include "prx/libSceIme/include/ImeInput.hpp"
 #include "prx/libSceVideoOut/include/ImeTextInput.hpp"
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -254,6 +255,16 @@ void CheckValidation() {
     extended.reserved[59] = 1;
     Require(sceImeOpen_nid_postfix(&param, &extended) == InvalidExtended, "extended reserved");
 
+    errno = 71;
+    Require(sceImeOpen_nid_postfix(reinterpret_cast<const Param*>(0x10), nullptr) == InvalidAddress, "unreadable param");
+    Require(errno == 71, "errno preserved after an unreadable param");
+    Require(sceImeOpen_nid_postfix(&param, reinterpret_cast<const ExtendedParam*>(0x10)) == InvalidAddress, "unreadable extended");
+    Require(errno == 71, "errno preserved after an unreadable extended");
+    expect([](Param& p) { p.input_text_buffer = reinterpret_cast<char16_t*>(0x10); }, InvalidAddress, "unreadable text buffer");
+    Require(sceImeOpen_nid_postfix(&param, nullptr) == 0, "open with errno set");
+    Require(errno == 71, "errno preserved by a successful open");
+    Require(sceImeClose_nid_postfix() == 0, "close after the errno check");
+
     param.posx = 3000.0f;
     param.option = 0x4000;
     Require(sceImeOpen_nid_postfix(&param, nullptr) == 0, "over-2K coordinates");
@@ -350,9 +361,14 @@ void CheckEditing() {
     Caret caret{};
     caret.index = 6;
     Require(sceImeSetCaret(nullptr) == InvalidAddress, "null caret");
+    errno = 71;
+    Require(sceImeSetCaret(reinterpret_cast<const Caret*>(0x10)) == InvalidAddress, "unreadable caret");
+    Require(errno == 71, "errno preserved after an unreadable caret");
     Require(sceImeSetCaret(&caret) == InvalidParam, "caret past the text");
+    Require(errno == 71, "errno preserved after a caret past the text");
     caret.index = 1;
     Require(sceImeSetCaret(&caret) == 0, "set caret");
+    Require(errno == 71, "errno preserved by set caret");
     Publish(ImeHostInputKind::Text, "X");
     events = Drain();
     RequireText(events.at(0), EventUpdateText, u"hXello", 2, 1, 1);
