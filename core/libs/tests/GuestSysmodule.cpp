@@ -4,6 +4,7 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libSceSysmodule/ModuleTable.hpp"
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -494,4 +495,36 @@ int main() {
     moduleResult = -1;
     Require(sceSysmoduleLoadModuleByNameInternal("libSceNoSuchModule", 0, nullptr, 0, &moduleResult) < 0);
     Require(sceKernelStopUnloadModule(byName, 0, nullptr, 0, nullptr, nullptr) == 0);
+
+    Require(sceSysmoduleLoadModule(kFiberModuleId) == 0);
+    Require(sceSysmoduleGetModuleHandleInternal(kFiberModuleId, reinterpret_cast<std::int32_t*>(0x10)) == kInvalidValue);
+    std::int32_t probeHandle = -1;
+    Require(sceSysmoduleGetModuleHandleInternal(kFiberModuleId, &probeHandle) == 0);
+    Require(probeHandle >= 0);
+    errno = 71;
+    Require(sceSysmoduleGetModuleHandleInternal(kFiberModuleId, reinterpret_cast<std::int32_t*>(0x10)) == kInvalidValue);
+    Require(errno == 71);
+    std::int32_t warmHandle = -1;
+    Require(sceSysmoduleGetModuleHandleInternal(kFiberModuleId, &warmHandle) == 0);
+    Require(errno == 71);
+    Require(warmHandle == probeHandle);
+    Require(sceSysmoduleUnloadModule(kFiberModuleId) == 0);
+
+    errno = 71;
+    int probeLoadResult = -1;
+    Require(sceSysmoduleLoadModuleInternalWithArg(kAgcDriverModuleId, 0, nullptr, 0, reinterpret_cast<int*>(0x10)) == kInvalidValue);
+    Require(errno == 71);
+    Require(sceSysmoduleIsLoadedInternal(kAgcDriverModuleId) == kModuleUnloaded);
+    Require(sceSysmoduleLoadModuleInternalWithArg(kAgcDriverModuleId, 0, nullptr, 0, &probeLoadResult) == 0);
+    Require(probeLoadResult == 0);
+    Require(errno == 71);
+    errno = 71;
+    Require(sceSysmoduleUnloadModuleInternalWithArg(kAgcDriverModuleId, 0, nullptr, 0, reinterpret_cast<int*>(0x10)) == kInvalidValue);
+    Require(errno == 71);
+    Require(sceSysmoduleIsLoadedInternal(kAgcDriverModuleId) == 0);
+    int probeUnloadResult = -1;
+    Require(sceSysmoduleUnloadModuleInternalWithArg(kAgcDriverModuleId, 0, nullptr, 0, &probeUnloadResult) == 0);
+    Require(probeUnloadResult == 0);
+    Require(errno == 71);
+    Require(sceSysmoduleIsLoadedInternal(kAgcDriverModuleId) == kModuleUnloaded);
 }

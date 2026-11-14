@@ -26,6 +26,7 @@
 #include "SceTypes.hpp"
 #include "ModuleTable.hpp"
 #include "prx/libc/include/General.hpp"
+#include <cerrno>
 
 namespace {
 
@@ -33,6 +34,13 @@ constexpr int SCE_SYSMODULE_ERROR_INVALID_VALUE = static_cast<int>(0x805A1000);
 constexpr int SCE_SYSMODULE_ERROR_UNLOADED = static_cast<int>(0x805A1001);
 constexpr int kRtldNow = 2;
 constexpr std::uint32_t kMeasuredInternalUnloadedModuleId = 0x800000c4u;
+
+bool writeGuestInt32(void* destination, std::int32_t value) {
+    const int savedErrno = errno;
+    const bool copied = GuestCopyOut_nid_no_patch(destination, &value, sizeof(value));
+    errno = savedErrno;
+    return copied;
+}
 
 const char* findModuleName(const std::uint32_t id) {
     const auto it = kModuleTable.find(id);
@@ -208,7 +216,9 @@ int APS5_VABI sceSysmoduleGetModuleHandleInternal(std::uint32_t id, std::int32_t
     }
     const auto existing = gHandles.find(id);
     if (existing != gHandles.end()) {
-        *handle = existing->second;
+        if (!writeGuestInt32(handle, static_cast<std::int32_t>(existing->second))) {
+            return SCE_SYSMODULE_ERROR_INVALID_VALUE;
+        }
         return 0;
     }
     void* module = openHostModule(name);
@@ -216,8 +226,10 @@ int APS5_VABI sceSysmoduleGetModuleHandleInternal(std::uint32_t id, std::int32_t
         throw std::runtime_error(std::string("sceSysmoduleGetModuleHandleInternal: failed to open ") + name);
     }
     const auto value = static_cast<KernelModule>(reinterpret_cast<std::intptr_t>(module));
+    if (!writeGuestInt32(handle, value)) {
+        return SCE_SYSMODULE_ERROR_INVALID_VALUE;
+    }
     gHandles.emplace(id, value);
-    *handle = value;
     return 0;
 }
 
@@ -261,10 +273,10 @@ int APS5_VABI sceSysmoduleLoadModuleInternalWithArg(std::uint32_t id, int argc, 
         throw std::runtime_error(std::string("sceSysmoduleLoadModuleInternalWithArg: unknown id ") + std::to_string(id));
     }
     std::lock_guard<std::mutex> lock(gMutex);
-    gLoadCount[id]++;
-    if (ret) {
-        *ret = 0;
+    if (ret && !writeGuestInt32(ret, 0)) {
+        return SCE_SYSMODULE_ERROR_INVALID_VALUE;
     }
+    gLoadCount[id]++;
     return 0;
 }
 
@@ -334,10 +346,10 @@ int APS5_VABI sceSysmoduleUnloadModuleInternalWithArg(std::uint32_t id, int argc
     if (it == gLoadCount.end() || it->second < 1) {
         return SCE_SYSMODULE_ERROR_UNLOADED;
     }
-    it->second--;
-    if (ret) {
-        *ret = 0;
+    if (ret && !writeGuestInt32(ret, 0)) {
+        return SCE_SYSMODULE_ERROR_INVALID_VALUE;
     }
+    it->second--;
     return 0;
 }
 
