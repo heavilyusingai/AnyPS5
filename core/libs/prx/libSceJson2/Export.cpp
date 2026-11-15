@@ -14,6 +14,7 @@
 #include <iterator>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <type_traits>
 #include <stdexcept>
 #include <string>
@@ -342,35 +343,33 @@ bool SearchEqual(const char* left, const char* right, std::size_t count) {
     return bounded <= 0 || std::strncmp(left, right, static_cast<std::size_t>(bounded)) == 0;
 }
 
-std::size_t FindText(const String& string, const char* needle, std::size_t position, std::size_t count) {
+std::size_t FindText(const std::string& characters, const Text& header, std::string_view needle, std::size_t count, std::size_t position) {
     constexpr auto missing = std::numeric_limits<std::size_t>::max();
-    if (!string.text) return missing;
-    const std::size_t length = string.text->length;
+    const std::size_t length = header.length;
     if (!count) return position <= length ? position : missing;
     if (position >= length || count > length - position) return missing;
-    if (!needle) { NotImplemented_nid_no_patch(__func__); return missing; }
-    const char* begin = string.text->characters;
+    if (!needle.data()) { NotImplemented_nid_no_patch(__func__); return missing; }
+    const char* const begin = characters.data() - position;
     const char* cursor = begin + position;
     while (cursor < begin + length) {
-        const char* candidate = std::strchr(cursor, static_cast<unsigned char>(*needle));
+        const char* candidate = std::strchr(cursor, static_cast<unsigned char>(needle.front()));
         if (!candidate) return missing;
-        if (SearchEqual(candidate, needle, count)) return static_cast<std::size_t>(candidate - begin);
+        if (SearchEqual(candidate, needle.data(), count)) return static_cast<std::size_t>(candidate - begin);
         cursor = candidate + 1;
     }
     return missing;
 }
 
-std::size_t ReverseFindText(const String& string, const char* needle, std::size_t position, std::size_t count) {
+std::size_t ReverseFindText(const std::string& characters, const Text& header, std::string_view needle, std::size_t count, std::size_t position) {
     constexpr auto missing = std::numeric_limits<std::size_t>::max();
-    if (!string.text) return missing;
-    const std::size_t length = string.text->length;
+    const std::size_t length = header.length;
     if (!count) return std::min(position, length);
     if (count > length) return missing;
-    if (!needle) { NotImplemented_nid_no_patch(__func__); return missing; }
+    if (!needle.data()) { NotImplemented_nid_no_patch(__func__); return missing; }
     std::size_t index = std::min(position, length - count);
     for (;;) {
-        const char* candidate = string.text->characters + index;
-        if (*candidate == *needle && SearchEqual(candidate, needle, count)) return index;
+        const char* candidate = characters.data() + index;
+        if (*candidate == needle.front() && SearchEqual(candidate, needle.data(), count)) return index;
         if (!index) return missing;
         --index;
     }
@@ -398,10 +397,9 @@ bool ModernValues() {
     return sdk >= 0x06000000 || (sdk >= 0x05508700 && sdk < 0x05510000);
 }
 
-bool Grow(Text& text, std::size_t requested) {
+std::uint32_t GrownCapacity(std::uint32_t current, std::size_t requested) {
     if (requested > std::numeric_limits<std::uint32_t>::max())
         throw std::length_error("sce::Json::String: capacity exceeds 32 bits");
-    if (requested <= text.capacity) return true;
     std::uint32_t capacity = static_cast<std::uint32_t>(requested);
     bool padded;
     {
@@ -411,11 +409,17 @@ bool Grow(Text& text, std::size_t requested) {
     }
     if (padded) {
         capacity |= 0x10;
-        if (capacity / 3 < text.capacity / 2) {
-            const auto grown = std::uint64_t{text.capacity} + text.capacity / 2;
+        if (capacity / 3 < current / 2) {
+            const auto grown = std::uint64_t{current} + current / 2;
             capacity = static_cast<std::uint32_t>(std::min(grown, std::uint64_t{std::numeric_limits<std::uint32_t>::max()}));
         }
     }
+    return capacity;
+}
+
+bool Grow(Text& text, std::size_t requested) {
+    if (requested <= text.capacity) return true;
+    const std::uint32_t capacity = GrownCapacity(text.capacity, requested);
     auto* memory = static_cast<char*>(Allocate(capacity));
     if (!memory) return false;
     std::memcpy(memory, text.characters, text.length);
@@ -478,6 +482,300 @@ void Construct(String& string, const String& source) {
     Construct(string, std::string_view{});
     AssignText(string, View(source), true);
 }
+
+struct RestoreErrno {
+    int value = errno;
+    ~RestoreErrno() { errno = value; }
+};
+
+// Probed guest-pointer access for the public String API. Every dereference of a
+// caller-supplied String object, Text header or character buffer goes through
+// checked copies, so unreadable guest memory fails the probe instead of
+// crashing the host. Readable memory keeps the raw-access behavior.
+bool ProbeSelf(const String* self, Text*& pointer) {
+    if (!self) return false;
+    RestoreErrno restore;
+    return GuestCopyIn_nid_no_patch(&pointer, &self->text, sizeof(pointer));
+}
+
+bool ProbeHeader(Text* pointer, Text& header) {
+    if (!pointer) return false;
+    RestoreErrno restore;
+    return GuestCopyIn_nid_no_patch(&header, pointer, sizeof(header));
+}
+
+bool ProbeRange(std::string& destination, const void* source, std::size_t bytes) {
+    if (!bytes) return true;
+    if (!source) return false;
+    try {
+        destination.resize(bytes);
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+    RestoreErrno restore;
+    return GuestCopyIn_nid_no_patch(destination.data(), source, bytes);
+}
+
+bool ProbeZString(std::string& destination, const char* source, std::size_t maximum = std::numeric_limits<std::size_t>::max(), bool includeTerminator = false) {
+    if (!source) return false;
+    RestoreErrno restore;
+    destination.clear();
+    char chunk[4096];
+    for (std::size_t offset = 0; offset < maximum;) {
+        const auto address = reinterpret_cast<std::uintptr_t>(source) + offset;
+        const std::size_t aligned = sizeof(chunk) - address % sizeof(chunk);
+        const std::size_t count = std::min(aligned, maximum - offset);
+        if (!GuestCopyIn_nid_no_patch(chunk, source + offset, count)) return false;
+        if (const void* end = std::memchr(chunk, 0, count)) {
+            const auto length = static_cast<std::size_t>(static_cast<const char*>(end) - chunk);
+            destination.append(chunk, length + (includeTerminator ? 1 : 0));
+            return true;
+        }
+        destination.append(chunk, count);
+        offset += count;
+    }
+    return true;
+}
+
+std::optional<std::string> ProbeCharacters(const Text& header, bool terminated) {
+    const std::size_t bytes = header.length + (terminated ? 1 : 0);
+    std::string characters;
+    if (ProbeRange(characters, header.characters, bytes)) return characters;
+    if (!terminated || !header.length || !ProbeRange(characters, header.characters, header.length)) return std::nullopt;
+    characters.push_back('\0');
+    return characters;
+}
+
+// strlen-parity read of the inspected characters: the raw helpers scan until
+// the stored terminator rather than stopping at the logical length.
+std::optional<std::string> ProbeZCharacters(const Text& header) {
+    std::string characters;
+    if (header.characters && ProbeZString(characters, header.characters)) return characters;
+    return std::nullopt;
+}
+
+std::string ZCharactersOrEmpty(const Text& header) {
+    auto characters = ProbeZCharacters(header);
+    return characters ? std::move(*characters) : std::string{};
+}
+
+// Writes zeros in fixed chunks so huge resize requests cannot allocate the
+// whole span on the host.
+bool WriteProbedZeros(char* destination, std::size_t bytes) {
+    static constexpr std::size_t chunkSize = 4096;
+    const char chunk[chunkSize]{};
+    for (std::size_t offset = 0; offset < bytes;) {
+        const std::size_t count = std::min(chunkSize, bytes - offset);
+        RestoreErrno restore;
+        if (!GuestCopyOut_nid_no_patch(destination + offset, chunk, count)) return false;
+        offset += count;
+    }
+    return true;
+}
+
+
+std::optional<Text> ProbeStringHeader(const String* self) {
+    Text* pointer = nullptr;
+    Text header{};
+    if (!ProbeSelf(self, pointer) || !ProbeHeader(pointer, header)) return std::nullopt;
+    return header;
+}
+
+bool WriteHeader(Text* pointer, const Text& header) {
+    if (!pointer) return false;
+    RestoreErrno restore;
+    // Field-wise like the raw stores, so the reserved header bytes survive.
+    return GuestCopyOut_nid_no_patch(&pointer->characters, &header.characters, sizeof(header.characters)) &&
+           GuestCopyOut_nid_no_patch(&pointer->length, &header.length, sizeof(header.length)) &&
+           GuestCopyOut_nid_no_patch(&pointer->capacity, &header.capacity, sizeof(header.capacity));
+}
+
+bool WriteSelf(String* self, const Text* pointer) {
+    if (!self) return false;
+    RestoreErrno restore;
+    return GuestCopyOut_nid_no_patch(&self->text, &pointer, sizeof(pointer));
+}
+
+void SetDefaultHeaderRetired(ValueType type, const void* owner, bool retired);
+
+
+// Grows the header stored in guest memory. The host copy is updated on
+// success; allocator-provided memory is written with checked copies because
+// the source characters come from an inspected header.
+bool GrowProbed(String* self, Text* pointer, Text& header, std::size_t requested) {
+    if (requested <= header.capacity) return true;
+    const std::uint32_t capacity = GrownCapacity(header.capacity, requested);
+    auto* memory = static_cast<char*>(Allocate(capacity));
+    if (!memory) return false;
+    if (header.length) {
+        std::string characters;
+        if (!ProbeRange(characters, header.characters, header.length) ||
+            !GuestCopyOut_nid_no_patch(memory, characters.data(), header.length)) {
+            Release(memory);
+            return false;
+        }
+    }
+    const char terminator = 0;
+    if (!GuestCopyOut_nid_no_patch(memory + header.length, &terminator, 1)) {
+        Release(memory);
+        return false;
+    }
+    if (header.characters != emptyCharacters) Release(header.characters);
+    header.characters = memory;
+    header.capacity = capacity;
+    return WriteHeader(pointer, header);
+}
+
+void ClearProbed(String* self, Text* pointer) {
+    if (!self) return;
+    Text header{};
+    if (!ProbeHeader(pointer, header)) return;
+    if (header.characters != emptyCharacters) Release(header.characters);
+    header.characters = emptyCharacters;
+    header.length = 0;
+    header.capacity = 0;
+    WriteHeader(pointer, header);
+}
+
+// Assigns host-side bytes into the inspected header. Mirrors AssignText:
+// failure of the character allocation or the header write-back leaves the
+// string empty without restoring the previous contents.
+void AssignProbed(String* self, std::string_view bytes, bool preserveBinary = false) {
+    Text* pointer = nullptr;
+    Text header{};
+    if (!ProbeSelf(self, pointer) || !ProbeHeader(pointer, header)) return;
+    if (bytes.data() == header.characters) return;
+    if (bytes.size() >= std::numeric_limits<std::uint32_t>::max())
+        throw std::length_error("sce::Json::String: length exceeds 32 bits");
+    ClearProbed(self, pointer);
+    if (bytes.empty() || (!preserveBinary && !bytes.front())) return;
+    auto* memory = static_cast<char*>(Allocate(bytes.size() + 1));
+    if (!memory) return;
+    std::memcpy(memory, bytes.data(), bytes.size());
+    memory[bytes.size()] = 0;
+    header.characters = memory;
+    header.length = static_cast<std::uint32_t>(bytes.size());
+    header.capacity = static_cast<std::uint32_t>(bytes.size() + 1);
+    if (!WriteHeader(pointer, header)) Release(memory);
+}
+
+// Appends host-side bytes that cannot alias the inspected header. Mirrors
+// AppendText: a failed growth or write-back leaves the string unchanged.
+void AppendProbed(String* self, std::string_view bytes) {
+    Text* pointer = nullptr;
+    Text header{};
+    if (!ProbeSelf(self, pointer) || !ProbeHeader(pointer, header)) return;
+    if (bytes.size() >= std::numeric_limits<std::uint32_t>::max() - header.length)
+        throw std::length_error("sce::Json::String: length exceeds 32 bits");
+    if (!GrowProbed(self, pointer, header, header.length + bytes.size() + 1)) return;
+    if (!bytes.empty() && !GuestCopyOut_nid_no_patch(header.characters + header.length, bytes.data(), bytes.size())) return;
+    const char terminator = 0;
+    if (!GuestCopyOut_nid_no_patch(header.characters + header.length + bytes.size(), &terminator, 1)) return;
+    header.length += static_cast<std::uint32_t>(bytes.size());
+    WriteHeader(pointer, header);
+}
+
+// Constructs a String whose Text header lives in guest memory. The header
+// allocation failure leaves the destination untouched, matching Construct.
+void ConstructProbed(String* self, std::string_view bytes) {
+    if (!self) return;
+    auto* pointer = static_cast<Text*>(Allocate(sizeof(Text)));
+    if (!pointer) return;
+    Text header{emptyCharacters, 0, 0};
+    if (!WriteSelf(self, pointer)) {
+        Release(pointer);
+        return;
+    }
+    if (!WriteHeader(pointer, header)) return;
+    AssignProbed(self, bytes);
+}
+
+void ConstructProbed(String* self, const String* source) {
+    if (!self) return;
+    Text* pointer = nullptr;
+    if (!source || !ProbeSelf(source, pointer)) {
+        WriteSelf(self, nullptr);
+        return;
+    }
+    Text header{};
+    if (!ProbeHeader(pointer, header)) {
+        ConstructProbed(self, std::string_view{});
+        return;
+    }
+    const auto characters = ProbeCharacters(header, false);
+    if (!characters) {
+        ConstructProbed(self, std::string_view{});
+        return;
+    }
+    ConstructProbed(self, *characters);
+}
+
+// Releases the inspected header. An unreadable header leaves both the
+// character and header allocations unregistered rather than risking a
+// double release of a pointer that may no longer be owned.
+void DestroyProbed(String* self) {
+    if (!self) return;
+    Text* pointer = nullptr;
+    if (!ProbeSelf(self, pointer)) return;
+    if (!pointer) return;
+    Text header{};
+    if (!ProbeHeader(pointer, header)) return;
+    if (header.characters != emptyCharacters) Release(header.characters);
+    SetDefaultHeaderRetired(TypeString, self, true);
+    const Text poisoned{reinterpret_cast<char*>(std::uintptr_t{0xffffffff}),
+                        std::numeric_limits<std::uint32_t>::max(), std::numeric_limits<std::uint32_t>::max()};
+    WriteHeader(pointer, poisoned);
+    Release(pointer);
+    WriteSelf(self, nullptr);
+    SetDefaultHeaderRetired(TypeString, self, false);
+}
+
+std::size_t FindProbed(const String* self, std::string_view needle, std::size_t count, std::size_t position) {
+    constexpr auto missing = std::numeric_limits<std::size_t>::max();
+    const auto header = ProbeStringHeader(self);
+    if (!header) return missing;
+    if (!count) return position <= header->length ? position : missing;
+    if (position >= header->length || count > header->length - position) return missing;
+    if (!needle.data()) { NotImplemented_nid_no_patch(__func__); return missing; }
+    // Raw strchr scans from the starting position until the next terminator,
+    // which may sit beyond the logical length. Copy that scan window with
+    // checked reads; a chunk that cannot be read ends the window where raw
+    // would have crashed.
+    std::string scanned;
+    if (!header->characters) return missing;
+    const char* const source = header->characters + position;
+    for (std::size_t offset = 0;;) {
+        const auto address = reinterpret_cast<std::uintptr_t>(source) + offset;
+        const std::size_t aligned = 4096 - address % 4096;
+        std::string chunk;
+        if (!ProbeRange(chunk, source + offset, aligned)) break;
+        if (const void* end = std::memchr(chunk.data(), 0, chunk.size())) {
+            scanned.append(chunk.data(), static_cast<std::size_t>(static_cast<const char*>(end) - chunk.data()));
+            break;
+        }
+        scanned.append(chunk);
+        offset += aligned;
+    }
+    return FindText(scanned, *header, needle, count, position);
+}
+
+std::size_t ReverseFindProbed(const String* self, std::string_view needle, std::size_t count, std::size_t position) {
+    constexpr auto missing = std::numeric_limits<std::size_t>::max();
+    const auto header = ProbeStringHeader(self);
+    if (!header) return missing;
+    const auto characters = ProbeCharacters(*header, false);
+    if (!characters) return missing;
+    return ReverseFindText(*characters, *header, needle, count, position);
+}
+
+std::string StringCharactersOrEmpty(const String* self) {
+    const auto header = ProbeStringHeader(self);
+    if (!header) return std::string{};
+    const auto characters = ProbeCharacters(*header, false);
+    return characters ? std::move(*characters) : std::string{};
+}
+
+
 struct GuestOutOfMemory {};
 
 void Construct(Value& value);
@@ -2718,79 +3016,209 @@ Object* _ZN3sce4Json5Value12s_nullobjectE = nullptr;
 }
 std::size_t _ZN3sce4Json6String4nposE = static_cast<std::size_t>(-1);
 
-void APS5_VABI _ZN3sce4Json6StringC1Ev(String* self) { Construct(*self, std::string_view{}); }
-void APS5_VABI _ZN3sce4Json6StringC1EPKc(String* self, const char* text) { Construct(*self, text ? text : ""); }
-void APS5_VABI _ZN3sce4Json6StringC1ERKS1_(String* self, const String* other) { Construct(*self, *other); }
-void APS5_VABI _ZN3sce4Json6StringD1Ev(String* self) { Destroy(*self); }
+void APS5_VABI _ZN3sce4Json6StringC1Ev(String* self) { ConstructProbed(self, std::string_view{}); }
+void APS5_VABI _ZN3sce4Json6StringC1EPKc(String* self, const char* text) {
+    std::string bytes;
+    if (text && !ProbeZString(bytes, text)) text = nullptr;
+    ConstructProbed(self, text ? std::string_view{bytes} : std::string_view{""});
+}
+void APS5_VABI _ZN3sce4Json6StringC1ERKS1_(String* self, const String* other) { ConstructProbed(self, other); }
+void APS5_VABI _ZN3sce4Json6StringD1Ev(String* self) { DestroyProbed(self); }
 String* APS5_VABI _ZN3sce4Json6StringaSERKS1_(String* self, const String* other) {
-    if (self->text != other->text && other->text) AssignText(*self, View(*other), true);
+    Text* selfPointer = nullptr;
+    Text* otherPointer = nullptr;
+    Text otherHeader{};
+    if (ProbeSelf(self, selfPointer) && other && ProbeSelf(other, otherPointer) && otherPointer &&
+        selfPointer != otherPointer && ProbeHeader(otherPointer, otherHeader)) {
+        if (const auto bytes = ProbeCharacters(otherHeader, false)) AssignProbed(self, *bytes, true);
+    }
     return self;
 }
-const char* APS5_VABI _ZNK3sce4Json6String5c_strEv(const String* self) { return Characters(*self); }
-bool APS5_VABI _ZNK3sce4Json6String5emptyEv(const String* self) { return View(*self).empty(); }
-std::size_t APS5_VABI _ZNK3sce4Json6String6lengthEv(const String* self) { return View(*self).size(); }
-std::size_t APS5_VABI _ZNK3sce4Json6String4sizeEv(const String* self) { return View(*self).size(); }
-std::size_t APS5_VABI _ZNK3sce4Json6String8capacityEv(const String* self) { return self->text ? self->text->capacity : 0; }
-bool APS5_VABI _ZNK3sce4Json6StringeqEPKc(const String* self, const char* text) { return text != nullptr && CompareText(Characters(*self), text) == 0; }
-bool APS5_VABI _ZNK3sce4Json6StringeqERKS1_(const String* self, const String* other) { return other != nullptr && CompareText(Characters(*self), Characters(*other)) == 0; }
-void APS5_VABI _ZN3sce4Json6String5clearEv(String* self) { ClearText(*self); }
+const char* APS5_VABI _ZNK3sce4Json6String5c_strEv(const String* self) {
+    const auto header = ProbeStringHeader(self);
+    return header ? header->characters : emptyCharacters;
+}
+bool APS5_VABI _ZNK3sce4Json6String5emptyEv(const String* self) {
+    const auto header = ProbeStringHeader(self);
+    return !header || header->length == 0;
+}
+std::size_t APS5_VABI _ZNK3sce4Json6String6lengthEv(const String* self) {
+    const auto header = ProbeStringHeader(self);
+    return header ? header->length : 0;
+}
+std::size_t APS5_VABI _ZNK3sce4Json6String4sizeEv(const String* self) {
+    const auto header = ProbeStringHeader(self);
+    return header ? header->length : 0;
+}
+std::size_t APS5_VABI _ZNK3sce4Json6String8capacityEv(const String* self) {
+    const auto header = ProbeStringHeader(self);
+    return header ? header->capacity : 0;
+}
+bool APS5_VABI _ZNK3sce4Json6StringeqEPKc(const String* self, const char* text) {
+    if (!text) return false;
+    std::string bytes;
+    if (!ProbeZString(bytes, text)) return false;
+    const auto header = ProbeStringHeader(self);
+    return CompareText(header ? ZCharactersOrEmpty(*header).data() : "", bytes.data()) == 0;
+}
+bool APS5_VABI _ZNK3sce4Json6StringeqERKS1_(const String* self, const String* other) {
+    if (!other) return false;
+    const auto header = ProbeStringHeader(self);
+    const auto otherHeader = ProbeStringHeader(other);
+    const std::string left = header ? ZCharactersOrEmpty(*header) : std::string{};
+    const std::string right = otherHeader ? ZCharactersOrEmpty(*otherHeader) : std::string{};
+    return CompareText(left.data(), right.data()) == 0;
+}
+void APS5_VABI _ZN3sce4Json6String5clearEv(String* self) {
+    Text* pointer = nullptr;
+    if (ProbeSelf(self, pointer)) ClearProbed(self, pointer);
+}
 void APS5_VABI _ZN3sce4Json6String6resizeEm(String* self, std::size_t count) {
-    if (!self->text || count == self->text->length) return;
-    auto& text = *self->text;
-    if (count < text.length) { text.characters[count] = 0; text.length = static_cast<std::uint32_t>(count); }
-    else if (count < std::numeric_limits<std::uint32_t>::max() && Grow(text, count + 1)) {
-        std::memset(text.characters + text.length, 0, count - text.length + 1);
-        text.length = static_cast<std::uint32_t>(count);
-    } else if (count >= std::numeric_limits<std::uint32_t>::max()) {
+    Text* pointer = nullptr;
+    Text header{};
+    if (!ProbeSelf(self, pointer) || !ProbeHeader(pointer, header) || count == header.length) return;
+    if (count >= std::numeric_limits<std::uint32_t>::max())
         throw std::length_error("sce::Json::String: length exceeds 32 bits");
+    if (count < header.length) {
+        const char terminator = 0;
+        if (!GuestCopyOut_nid_no_patch(header.characters + count, &terminator, 1)) return;
+        header.length = static_cast<std::uint32_t>(count);
+        WriteHeader(pointer, header);
+    } else if (GrowProbed(self, pointer, header, count + 1)) {
+        if (!WriteProbedZeros(header.characters + header.length, count - header.length + 1)) return;
+        header.length = static_cast<std::uint32_t>(count);
+        WriteHeader(pointer, header);
     }
 }
-void APS5_VABI _ZN3sce4Json6String7reserveEm(String* self, std::size_t capacity) { if (self->text) Grow(*self->text, capacity); }
+void APS5_VABI _ZN3sce4Json6String7reserveEm(String* self, std::size_t capacity) {
+    Text* pointer = nullptr;
+    Text header{};
+    if (!ProbeSelf(self, pointer) || !pointer || !ProbeHeader(pointer, header)) return;
+    GrowProbed(self, pointer, header, capacity);
+}
 String* APS5_VABI _ZN3sce4Json6String6appendERKS1_(String* self, const String* other) {
-    AppendText(*self, Characters(*other));
+    Text* pointer = nullptr;
+    Text* otherPointer = nullptr;
+    if (!ProbeSelf(self, pointer) || !other || !ProbeSelf(other, otherPointer)) return self;
+    if (!otherPointer) {
+        AppendProbed(self, std::string_view{});
+        return self;
+    }
+    Text otherHeader{};
+    if (!ProbeHeader(otherPointer, otherHeader)) return self;
+    if (const auto bytes = ProbeZCharacters(otherHeader)) AppendProbed(self, *bytes);
     return self;
 }
 String* APS5_VABI _ZN3sce4Json6String6appendEPKc(String* self, const char* text) {
     if (!text) throw std::invalid_argument("sce::Json::String::append: null text");
-    AppendText(*self, text);
+    std::string bytes;
+    if (!ProbeZString(bytes, text)) throw std::invalid_argument("sce::Json::String::append: unreadable text");
+    AppendProbed(self, bytes);
     return self;
 }
 String* APS5_VABI _ZN3sce4Json6String6appendEPKcm(String* self, const char* text, std::size_t length) {
     if (!text && length) throw std::invalid_argument("sce::Json::String::append: null text");
-    AppendText(*self, {text ? text : "", length});
+    std::string bytes;
+    if (text && length && !ProbeRange(bytes, text, length))
+        throw std::invalid_argument("sce::Json::String::append: unreadable text");
+    AppendProbed(self, text ? std::string_view{bytes.data(), bytes.size()} : std::string_view{"", length});
     return self;
 }
 String* APS5_VABI _ZN3sce4Json6StringpLEPKc(String* self, const char* text) { return _ZN3sce4Json6String6appendEPKc(self, text); }
 String* APS5_VABI _ZN3sce4Json6StringpLEh(String* self, unsigned char ch) {
-    const char text[]{static_cast<char>(ch), 0};
-    AppendText(*self, text);
+    const char text = static_cast<char>(ch);
+    AppendProbed(self, std::string_view{&text, ch ? std::size_t{1} : std::size_t{0}});
     return self;
 }
 String* APS5_VABI _ZNK3sce4Json6String6substrEmm(String* result, const String* self, std::size_t position, std::size_t length) {
-    const auto source = View(*self);
-    if (position > source.size()) throw std::out_of_range("sce::Json::String::substr: position past the end");
-    Construct(*result, std::string_view{});
-    AssignText(*result, source.substr(position, length), true);
+    std::size_t size = 0;
+    std::string_view view{};
+    if (const auto header = ProbeStringHeader(self)) {
+        if (const auto characters = ProbeCharacters(*header, false)) {
+            size = header->length;
+            view = *characters;
+        }
+    }
+    if (position > size) throw std::out_of_range("sce::Json::String::substr: position past the end");
+    ConstructProbed(result, std::string_view{});
+    AssignProbed(result, view.substr(position, length), true);
     return result;
 }
 char APS5_VABI _ZNK3sce4Json6String2atEm(const String* self, std::size_t index) {
-    return !self->text ? 0 : index < self->text->length ? self->text->characters[index] : emptyCharacters[0];
+    const auto header = ProbeStringHeader(self);
+    if (!header || index >= header->length) return emptyCharacters[0];
+    char character = 0;
+    RestoreErrno restore;
+    if (!GuestCopyIn_nid_no_patch(&character, header->characters + index, sizeof(character))) return emptyCharacters[0];
+    return character;
 }
-std::size_t APS5_VABI _ZNK3sce4Json6String4findEPKcm(const String* self, const char* needle, std::size_t position) { return FindText(*self, needle, position, needle ? std::strlen(needle) : 0); }
-std::size_t APS5_VABI _ZNK3sce4Json6String4findEPKcmm(const String* self, const char* needle, std::size_t position, std::size_t count) { return FindText(*self, needle, position, count); }
-std::size_t APS5_VABI _ZNK3sce4Json6String4findERKS1_m(const String* self, const String* needle, std::size_t position) { return FindText(*self, Characters(*needle), position, std::strlen(Characters(*needle))); }
-std::size_t APS5_VABI _ZNK3sce4Json6String5rfindEPKcm(const String* self, const char* needle, std::size_t position) { return ReverseFindText(*self, needle, position, needle ? std::strlen(needle) : 0); }
-std::size_t APS5_VABI _ZNK3sce4Json6String5rfindEPKcmm(const String* self, const char* needle, std::size_t position, std::size_t count) { return ReverseFindText(*self, needle, position, count); }
-std::size_t APS5_VABI _ZNK3sce4Json6String5rfindERKS1_m(const String* self, const String* needle, std::size_t position) { return ReverseFindText(*self, Characters(*needle), position, std::strlen(Characters(*needle))); }
-std::size_t APS5_VABI _ZNK3sce4Json6String4findEcm(const String* self, char character, std::size_t position) { return FindText(*self, &character, position, 1); }
-std::size_t APS5_VABI _ZNK3sce4Json6String5rfindEcm(const String* self, char character, std::size_t position) { return ReverseFindText(*self, &character, position, 1); }
+std::size_t APS5_VABI _ZNK3sce4Json6String4findEPKcm(const String* self, const char* needle, std::size_t position) {
+    std::string bytes;
+    if (needle && !ProbeZString(bytes, needle)) return std::numeric_limits<std::size_t>::max();
+    return FindProbed(self, needle ? std::string_view{bytes} : std::string_view{}, bytes.size(), position);
+}
+std::size_t APS5_VABI _ZNK3sce4Json6String4findEPKcmm(const String* self, const char* needle, std::size_t position, std::size_t count) {
+    std::string bytes;
+    if (needle && count && !ProbeZString(bytes, needle, count, true)) return std::numeric_limits<std::size_t>::max();
+    return FindProbed(self, needle ? std::string_view{bytes.data(), std::min(count, bytes.size())} : std::string_view{}, count, position);
+}
+std::size_t APS5_VABI _ZNK3sce4Json6String4findERKS1_m(const String* self, const String* needle, std::size_t position) {
+    constexpr auto missing = std::numeric_limits<std::size_t>::max();
+    if (!needle) return missing;
+    Text* otherPointer = nullptr;
+    if (!ProbeSelf(needle, otherPointer)) return missing;
+    if (!otherPointer) return FindProbed(self, std::string_view{}, 0, position);
+    Text otherHeader{};
+    if (!ProbeHeader(otherPointer, otherHeader)) return missing;
+    const auto bytes = ProbeZCharacters(otherHeader);
+    if (!bytes) return missing;
+    return FindProbed(self, *bytes, bytes->size(), position);
+}
+std::size_t APS5_VABI _ZNK3sce4Json6String5rfindEPKcm(const String* self, const char* needle, std::size_t position) {
+    std::string bytes;
+    if (needle && !ProbeZString(bytes, needle)) return std::numeric_limits<std::size_t>::max();
+    return ReverseFindProbed(self, needle ? std::string_view{bytes} : std::string_view{}, bytes.size(), position);
+}
+std::size_t APS5_VABI _ZNK3sce4Json6String5rfindEPKcmm(const String* self, const char* needle, std::size_t position, std::size_t count) {
+    std::string bytes;
+    if (needle && count && !ProbeZString(bytes, needle, count, true)) return std::numeric_limits<std::size_t>::max();
+    return ReverseFindProbed(self, needle ? std::string_view{bytes.data(), std::min(count, bytes.size())} : std::string_view{}, count, position);
+}
+std::size_t APS5_VABI _ZNK3sce4Json6String5rfindERKS1_m(const String* self, const String* needle, std::size_t position) {
+    constexpr auto missing = std::numeric_limits<std::size_t>::max();
+    if (!needle) return missing;
+    Text* otherPointer = nullptr;
+    if (!ProbeSelf(needle, otherPointer)) return missing;
+    if (!otherPointer) return ReverseFindProbed(self, std::string_view{}, 0, position);
+    Text otherHeader{};
+    if (!ProbeHeader(otherPointer, otherHeader)) return missing;
+    const auto bytes = ProbeZCharacters(otherHeader);
+    if (!bytes) return missing;
+    return ReverseFindProbed(self, *bytes, bytes->size(), position);
+}
+std::size_t APS5_VABI _ZNK3sce4Json6String4findEcm(const String* self, char character, std::size_t position) { return FindProbed(self, std::string_view{&character, 1}, 1, position); }
+std::size_t APS5_VABI _ZNK3sce4Json6String5rfindEcm(const String* self, char character, std::size_t position) { return ReverseFindProbed(self, std::string_view{&character, 1}, 1, position); }
 int APS5_VABI _ZNK3sce4Json6String7compareEPKc(const String* self, const char* text) {
     if (!text) throw std::invalid_argument("sce::Json::String::compare: null text");
-    return CompareText(Characters(*self), text);
+    std::string bytes;
+    if (!ProbeZString(bytes, text)) throw std::invalid_argument("sce::Json::String::compare: unreadable text");
+    const auto header = ProbeStringHeader(self);
+    if (!header) return CompareText("", bytes.data());
+    return CompareText(ZCharactersOrEmpty(*header).data(), bytes.data());
 }
 int APS5_VABI _ZNK3sce4Json6String7compareERKS1_(const String* self, const String* other) {
     if (!other) throw std::invalid_argument("sce::Json::String::compare: null other");
-    return CompareText(Characters(*self), Characters(*other));
+    Text* otherPointer = nullptr;
+    if (!ProbeSelf(other, otherPointer)) throw std::invalid_argument("sce::Json::String::compare: unreadable other");
+    std::string bytes;
+    if (otherPointer) {
+        Text otherHeader{};
+        if (!ProbeHeader(otherPointer, otherHeader) || !ProbeZString(bytes, otherHeader.characters))
+            throw std::invalid_argument("sce::Json::String::compare: unreadable other");
+    }
+    const auto header = ProbeStringHeader(self);
+    if (!header) return CompareText("", bytes.data());
+    return CompareText(ZCharactersOrEmpty(*header).data(), bytes.data());
 }
 
 void APS5_VABI _ZN3sce4Json5ArrayC1Ev(Array* self) { Construct(*self); }
