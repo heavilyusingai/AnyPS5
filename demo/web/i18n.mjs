@@ -173,6 +173,7 @@ export const messages = {
 
         "invalidLibraryTarget": "Invalid library target",
         "phaseDownloadingLibraries": "Downloading system libraries",
+        "phaseCachedLibraries": "Using cached system libraries",
         "cannotLoadManifest": "Cannot load release manifest ({status})",
         "invalidReleaseManifest": "Invalid release manifest",
         "cannotVerifyRelease": "Cannot verify the latest release ({status}). Try again later.",
@@ -355,6 +356,7 @@ export const messages = {
 
         "invalidLibraryTarget": "Ungültiges Bibliotheksziel",
         "phaseDownloadingLibraries": "Systembibliotheken werden heruntergeladen",
+        "phaseCachedLibraries": "Zwischengespeicherte Systembibliotheken werden verwendet",
         "cannotLoadManifest": "Release-Manifest kann nicht geladen werden ({status})",
         "invalidReleaseManifest": "Ungültiges Release-Manifest",
         "cannotVerifyRelease": "Das neueste Release kann nicht verifiziert werden ({status}). Versuche es später erneut.",
@@ -537,6 +539,7 @@ export const messages = {
 
         "invalidLibraryTarget": "وجهة المكتبات غير صالحة",
         "phaseDownloadingLibraries": "تنزيل مكتبات النظام",
+        "phaseCachedLibraries": "استخدام مكتبات النظام المخزنة مؤقتًا",
         "cannotLoadManifest": "تعذر تحميل بيان الإصدار ({status})",
         "invalidReleaseManifest": "بيان الإصدار غير صالح",
         "cannotVerifyRelease": "تعذر التحقق من أحدث إصدار ({status}). حاول مرة أخرى لاحقًا.",

@@ -11,8 +11,8 @@ const valid = target => ({ tag: "v1.2.3", platforms: { [target]: { size: 3, expa
 async function load(release, options = {}) {
   const requests = [];
   let cancelled = false;
-  const context = vm.createContext({ console, Uint8Array, Blob, ReadableStream, WritableStream, performance, crypto: webcrypto,
-    self: { postMessage() {} }, fetch: async url => {
+  const context = vm.createContext({ console, Uint8Array, Blob, ReadableStream, WritableStream, Response, performance, crypto: webcrypto,
+    self: { postMessage() {}, caches: options.caches }, fetch: async url => {
       requests.push(url);
       if (url === "./release.json") return { ok: true, json: async () => release };
       if (url.startsWith("https:")) return options.rateLimit ? { ok: false, status: 403, headers: new Map([["x-ratelimit-remaining", "0"]]) } : { ok: true, json: async () => ({ tag_name: release.tag }) };
@@ -27,7 +27,7 @@ async function load(release, options = {}) {
     return new vm.SyntheticModule(Object.keys(exports), function() { for (const [key, value] of Object.entries(exports)) this.setExport(key, value); }, { context });
   });
   await module.evaluate();
-  return { api: module.namespace, requests, cancelled: () => cancelled };
+  return { api: module.namespace, requests, cancelled: () => cancelled, cache: options.caches };
 }
 
 const invalid = [null, [], {}, { tag: "v1", platforms: null }, { ...valid("linux"), tag: "" }, { ...valid("linux"), tag: "v1." }];
@@ -61,4 +61,39 @@ await assert.rejects(corrupt.api.downloadLibraries("linux"), /checksum mismatch/
 const oversized = await load(valid("linux"), { contents: new Uint8Array([1, 2, 3, 4]), keepOpen: true });
 await assert.rejects(oversized.api.downloadLibraries("linux"), /download is incomplete/);
 assert.equal(oversized.cancelled(), true);
-console.log(JSON.stringify({ invalid: invalid.length + 1, valid: validCount }));
+
+function fakeCache() {
+  const store = new Map();
+  return {
+    opens: 0, puts: 0, deletes: 0, matches: 0,
+    async open() { this.opens++; return this; },
+    async match(path) { this.matches++; return store.has(path) ? new Response(store.get(path)) : undefined; },
+    async put(path, response) { this.puts++; store.set(path, await response.arrayBuffer()); },
+    async delete(path) { this.deletes++; return store.delete(path); },
+    raw: path => store.get(path),
+  };
+}
+const packOf = release => release.platforms.linux.path;
+const cachedRelease = valid("linux");
+const cached = await load(cachedRelease, { caches: fakeCache() });
+const first = await cached.api.downloadLibraries("linux");
+assert.equal(cached.cache.opens, 1);
+assert.equal(cached.cache.puts, 1);
+assert.deepEqual(new Uint8Array(await first.file.arrayBuffer()), bytes);
+assert.equal(cached.requests.filter(url => url === packOf(cachedRelease)).length, 1);
+const second = await cached.api.downloadLibraries("linux");
+assert.deepEqual(new Uint8Array(await second.file.arrayBuffer()), bytes);
+assert.equal(cached.requests.filter(url => url === packOf(cachedRelease)).length, 1);
+assert.equal(cached.cache.puts, 1);
+assert.equal(cached.cache.deletes, 0);
+const stale = await load(valid("linux"), { caches: fakeCache() });
+await stale.cache.put(packOf(cachedRelease), new Response(new Blob([new Uint8Array([9, 9, 9])])));
+const staleRefetched = await stale.api.downloadLibraries("linux");
+assert.deepEqual(new Uint8Array(await staleRefetched.file.arrayBuffer()), bytes);
+assert.equal(stale.cache.deletes, 1);
+assert.equal(stale.requests.filter(url => url.startsWith("libraries/")).length, 1);
+const uncached = await load(valid("linux"));
+assert.equal(uncached.cache, undefined);
+const downloaded = await uncached.api.downloadLibraries("linux");
+assert.deepEqual(new Uint8Array(await downloaded.file.arrayBuffer()), bytes);
+console.log(JSON.stringify({ invalid: invalid.length + 1, valid: validCount, cachedServed: true, cacheOpens: cached.cache.opens, cachePuts: cached.cache.puts, cacheDeletes: cached.cache.deletes }));
