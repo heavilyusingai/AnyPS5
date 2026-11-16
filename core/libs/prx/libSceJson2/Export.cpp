@@ -3716,129 +3716,385 @@ int APS5_VABI _ZNK3sce4Json6String7compareERKS1_(const String* self, const Strin
     return CompareText(ZCharactersOrEmpty(*header).data(), bytes.data());
 }
 
-void APS5_VABI _ZN3sce4Json5ArrayC1Ev(Array* self) { Construct(*self); }
-void APS5_VABI _ZN3sce4Json5ArrayC1ERKS1_(Array* self, const Array* other) { CopyArray(*self, *other); }
-void APS5_VABI _ZN3sce4Json5ArrayD1Ev(Array* self) { Destroy(*self); }
-Array* APS5_VABI _ZN3sce4Json5ArrayaSERKS1_(Array* self, const Array* other) { AssignArray(*self, *other); return self; }
-void APS5_VABI _ZN3sce4Json5Array10push_frontERKNS0_5ValueE(Array* self, const Value* value) { PrependArray(self, value); }
+// Probed guest-pointer access for the public Array/Object APIs. The eight-byte
+// storage and iterator-state fields are the only guest dereferences; storage
+// contents are allocator-backed host memory and keep the existing raw handling.
+
+bool ProbeField(const void* object, void* field) {
+    if (!object) return false;
+    RestoreErrno restore;
+    return GuestCopyIn_nid_no_patch(field, object, sizeof(void*));
+}
+
+bool WriteField(void* object, const void* value) {
+    if (!object) return false;
+    RestoreErrno restore;
+    return GuestCopyOut_nid_no_patch(object, value, sizeof(void*));
+}
+
+bool ProbeDwordField(const void* object, void* field) {
+    if (!object) return false;
+    RestoreErrno restore;
+    return GuestCopyIn_nid_no_patch(field, object, sizeof(std::uint32_t));
+}
+
+void ReleaseArrayStorage(ArrayStorage* items, const void* ownerAddress) {
+    if (!items) return;
+    items->ReleaseContents();
+    if (items->head) Release(items->head);
+    SetDefaultHeaderRetired(TypeArray, ownerAddress, true);
+    items->head = reinterpret_cast<ArrayLink*>(std::uintptr_t{0xffffffff});
+    items->count = std::numeric_limits<std::size_t>::max();
+    Release(items);
+    SetDefaultHeaderRetired(TypeArray, ownerAddress, false);
+}
+
+void ReleaseObjectStorage(ObjectStorage* items, const void* ownerAddress) {
+    if (!items) return;
+    items->clear();
+    if (items->head) Release(items->head);
+    SetDefaultHeaderRetired(TypeObject, ownerAddress, true);
+    items->head = reinterpret_cast<ObjectLink*>(std::uintptr_t{0xffffffff});
+    items->count = std::numeric_limits<std::size_t>::max();
+    Release(items);
+    SetDefaultHeaderRetired(TypeObject, ownerAddress, false);
+}
+
+ArrayLink* InsertArrayLinkProbed(ArrayStorage& items, ArrayLink* position, const Node& valueNode, const void* valueAddress) {
+    auto* link = static_cast<ArrayLink*>(Allocate(sizeof(ArrayLink)));
+    if (!link) return items.head;
+    try {
+        Construct(link->value);
+        AssignNodeProbed(link->value, valueNode, &link->value, valueAddress);
+    } catch (...) { Release(link); throw; }
+    link->previous = position->previous;
+    link->next = position;
+    position->previous->next = link;
+    position->previous = link;
+    ++items.count;
+    return link;
+}
+
+void AppendArrayProbed(Array* self, const Value* value) {
+    ArrayStorage* items = nullptr;
+    if (!ProbeField(self, &items) || !items || !ProbePayloadObject(items)) return;
+    Node valueNode{};
+    ProbeNode(value, valueNode);
+    AllocationOperation operation;
+    if (!ModernValues()) {
+        try {
+            Value& slot = items->emplace_back();
+            Construct(slot);
+            AssignNodeProbed(slot, valueNode, &slot, value);
+        } catch (const GuestOutOfMemory&) {}
+        if (operation.Finish()) items->PopBack();
+        return;
+    }
+    Value copy{};
+    copy.parent = items->Owner();
+    try {
+        AssignNodeProbed(copy, valueNode, &copy, value);
+        auto& inserted = items->emplace_back();
+        inserted.parent = items->Owner();
+        TransferPayload(inserted, copy);
+    } catch (const GuestOutOfMemory&) {
+    } catch (...) {
+        Destroy(copy);
+        throw;
+    }
+    Destroy(copy);
+    if (operation.Finish()) items->PopBack();
+}
+
+void PrependArrayProbed(Array* self, const Value* value) {
+    ArrayStorage* items = nullptr;
+    if (!ProbeField(self, &items) || !items) return;
+    Node valueNode{};
+    ProbeNode(value, valueNode);
+    AllocationOperation operation;
+    if (!ModernValues()) {
+        if (items->head) InsertArrayLinkProbed(*items, items->head->next, valueNode, value);
+    } else {
+        ScopedValue copy;
+        copy.value.parent = items->Owner();
+        AssignNodeProbed(copy.value, valueNode, &copy.value, value);
+        Value empty{};
+        if (items->head) InsertArrayLink(*items, items->head->next, empty);
+        if (items->count) TransferPayload(items->head->next->value, copy.value);
+    }
+    if (operation.Finish() && items->head && items->count) {
+        auto* link = items->head->next;
+        link->next->previous = items->head;
+        items->head->next = link->next;
+        Destroy(link->value);
+        Release(link);
+        --items->count;
+    }
+}
+
+Value* ObjectAccessProbed(Object* self, const String* input) {
+    ObjectStorage* items = nullptr;
+    if (!ProbeField(self, &items) || !items) return const_cast<Value*>(&Defaults(TypeNull));
+    Text* keyText = nullptr;
+    if (!ProbeSelf(input, keyText) || !keyText) return const_cast<Value*>(&Defaults(TypeNull));
+    Text keyHeader{};
+    if (!ProbeHeader(keyText, keyHeader)) return const_cast<Value*>(&Defaults(TypeNull));
+    const auto characters = ProbeCharacters(keyHeader, false);
+    if (!characters) return const_cast<Value*>(&Defaults(TypeNull));
+    if (!items->head) NotImplemented_nid_no_patch(__func__);
+    AllocationOperation operation;
+    ObjectLink* node;
+    {
+        InlineText key; key.Assign(*characters);
+        ScopedString defaultKey{std::string_view{}};
+        Pair source{}; source.key = defaultKey.string;
+        TemporaryTreeEntry entry(key.text, source);
+        bool inserted;
+        node = items->Insert(entry.key.text, entry.pair, inserted);
+    }
+    if (operation.Finish()) return const_cast<Value*>(&Defaults(TypeNull));
+    if (!node || node->nil) NotImplemented_nid_no_patch(__func__);
+    AssignText(node->pair.key, *characters, true);
+    node->pair.value.parent = items->Owner();
+    return &node->pair.value;
+}
+
+// TemporaryTreeEntry whose key and value sources arrive through checked copies.
+struct TemporaryTreeEntryProbed {
+    InlineText key;
+    Pair pair{};
+    TemporaryTreeEntryProbed(const Text& sourceKey, bool keyPresent, std::string_view keyBytes, const Node& valueNode, const void* valueAddress, std::uint32_t reserved) {
+        try {
+            key.Assign({sourceKey.characters, sourceKey.length});
+            if (keyPresent) Construct(pair.key, keyBytes);
+            std::memcpy(&pair.reserved, &reserved, sizeof(std::uint32_t));
+            Construct(pair.value);
+            AssignNodeProbed(pair.value, valueNode, &pair.value, valueAddress);
+        } catch (...) { Destroy(pair.value); Destroy(pair.key); throw; }
+    }
+    ~TemporaryTreeEntryProbed() { Destroy(pair.value); Destroy(pair.key); }
+};
+
+void APS5_VABI _ZN3sce4Json5ArrayC1Ev(Array* self) {
+    void* existing = nullptr;
+    if (!ProbeField(self, &existing)) return;
+    Array local{};
+    Construct(local);
+    if (!WriteField(self, &local.items)) Destroy(local);
+}
+void APS5_VABI _ZN3sce4Json5ArrayC1ERKS1_(Array* self, const Array* other) {
+    ArrayStorage* selfItems = nullptr;
+    ArrayStorage* otherItems = nullptr;
+    if (!ProbeField(self, &selfItems) || !ProbeField(other, &otherItems)) return;
+    if (!otherItems) {
+        ArrayStorage* nullItems = nullptr;
+        WriteField(self, &nullItems);
+        return;
+    }
+    Array local{};
+    Construct(local);
+    if (local.items && ProbePayloadObject(otherItems)) CopyArrayStorage(*local.items, *otherItems);
+    if (local.items && !WriteField(self, &local.items)) Destroy(local);
+}
+void APS5_VABI _ZN3sce4Json5ArrayD1Ev(Array* self) {
+    ArrayStorage* items = nullptr;
+    if (!ProbeField(self, &items) || !items || !ProbePayloadObject(items)) return;
+    ReleaseArrayStorage(items, self);
+    ArrayStorage* nullItems = nullptr;
+    WriteField(self, &nullItems);
+}
+Array* APS5_VABI _ZN3sce4Json5ArrayaSERKS1_(Array* self, const Array* other) {
+    ArrayStorage* selfItems = nullptr;
+    ArrayStorage* otherItems = nullptr;
+    if (!ProbeField(self, &selfItems) || !ProbeField(other, &otherItems)) return self;
+    if (!selfItems || !otherItems) return self;
+    if (!ProbePayloadObject(selfItems) || !ProbePayloadObject(otherItems)) return self;
+    Array local{selfItems};
+    AssignArray(local, Array{otherItems});
+    WriteField(self, &local.items);
+    return self;
+}
+void APS5_VABI _ZN3sce4Json5Array10push_frontERKNS0_5ValueE(Array* self, const Value* value) { PrependArrayProbed(self, value); }
 
 ArrayIterator* APS5_VABI _ZN3sce4Json5Array6insertERKNS1_8iteratorERKNS0_5ValueE(ArrayIterator* result, Array* self, const ArrayIterator* position, const Value* value) {
-    result->state = static_cast<ArrayIteratorState*>(Allocate(sizeof(ArrayIteratorState)));
-    if (result->state) result->state->position = nullptr;
-    if (!self->items) return result;
-    if (!position || !position->state || !position->state->position || !self->items->head) {
-        Release(result->state); result->state = nullptr;
+    ArrayStorage* items = nullptr;
+    ArrayIteratorState* resultState = nullptr;
+    if (!ProbeField(result, &resultState) || !ProbeField(self, &items)) return result;
+    ArrayIteratorState* state = static_cast<ArrayIteratorState*>(Allocate(sizeof(ArrayIteratorState)));
+    if (state) state->position = nullptr;
+    if (!WriteField(result, &state)) { if (state) Release(state); return result; }
+    if (!items) return result;
+    ArrayIteratorState* positionState = nullptr;
+    if (!ProbeField(position, &positionState) || !positionState || !positionState->position || !items->head || !ProbePayloadObject(items)) {
+        Release(state);
+        ArrayIteratorState* nullState = nullptr;
+        WriteField(result, &nullState);
         NotImplemented_nid_no_patch(__func__);
     }
+    Node valueNode{};
+    ProbeNode(value, valueNode);
     ArrayLink* inserted;
-    if (!ModernValues()) inserted = InsertArrayLink(*self->items, position->state->position, *value);
+    if (!ModernValues()) inserted = InsertArrayLinkProbed(*items, positionState->position, valueNode, value);
     else {
         ScopedValue copy;
-        copy.value.parent = self->items->Owner();
-        AssignNode(copy.value, *value);
+        copy.value.parent = items->Owner();
+        AssignNodeProbed(copy.value, valueNode, &copy.value, value);
         AllocationOperation operation;
         Value empty{};
-        inserted = InsertArrayLink(*self->items, position->state->position, empty);
+        inserted = InsertArrayLink(*items, positionState->position, empty);
         if (!operation.Finish()) TransferPayload(inserted->value, copy.value);
     }
-    if (inserted) { if (result->state) result->state->position = inserted; }
-    else { Release(result->state); result->state = nullptr; }
+    if (inserted) { if (state) state->position = inserted; }
+    else { if (state) Release(state); ArrayIteratorState* nullState = nullptr; WriteField(result, &nullState); }
     return result;
 }
 
-void APS5_VABI _ZN3sce4Json5Array9push_backERKNS0_5ValueE(Array* self, const Value* value) { AppendArray(self, value); }
+void APS5_VABI _ZN3sce4Json5Array9push_backERKNS0_5ValueE(Array* self, const Value* value) { AppendArrayProbed(self, value); }
 
 ArrayIterator* APS5_VABI _ZNK3sce4Json5Array5beginEv(ArrayIterator* result, const Array* self) {
-    result->state = static_cast<ArrayIteratorState*>(Allocate(sizeof(ArrayIteratorState)));
-    if (result->state) result->state->position = self->items && self->items->head ? self->items->head->next : nullptr;
-    if (self->items && (!self->items->head || !self->items->head->next)) {
-        Release(result->state);
-        result->state = nullptr;
+    ArrayStorage* items = nullptr;
+    ArrayIteratorState* resultState = nullptr;
+    if (!ProbeField(self, &items) || !ProbeField(result, &resultState)) return result;
+    ArrayIteratorState* state = static_cast<ArrayIteratorState*>(Allocate(sizeof(ArrayIteratorState)));
+    if (state) state->position = items && items->head ? items->head->next : nullptr;
+    if (items && (!items->head || !items->head->next)) {
+        Release(state);
+        state = nullptr;
     }
+    if (!WriteField(result, &state) && state) Release(state);
     return result;
 }
 ArrayIterator* APS5_VABI _ZNK3sce4Json5Array3endEv(ArrayIterator* result, const Array* self) {
-    result->state = static_cast<ArrayIteratorState*>(Allocate(sizeof(ArrayIteratorState)));
-    if (result->state) result->state->position = self->items ? self->items->head : nullptr;
-    if (self->items && !self->items->head) {
-        Release(result->state);
-        result->state = nullptr;
+    ArrayStorage* items = nullptr;
+    ArrayIteratorState* resultState = nullptr;
+    if (!ProbeField(self, &items) || !ProbeField(result, &resultState)) return result;
+    ArrayIteratorState* state = static_cast<ArrayIteratorState*>(Allocate(sizeof(ArrayIteratorState)));
+    if (state) state->position = items ? items->head : nullptr;
+    if (items && !items->head) {
+        Release(state);
+        state = nullptr;
     }
+    if (!WriteField(result, &state) && state) Release(state);
     return result;
 }
-bool APS5_VABI _ZNK3sce4Json5Array5emptyEv(const Array* self) { return !self->items || self->items->empty(); }
-std::size_t APS5_VABI _ZNK3sce4Json5Array4sizeEv(const Array* self) { return self->items ? self->items->size() : 0; }
+bool APS5_VABI _ZNK3sce4Json5Array5emptyEv(const Array* self) {
+    ArrayStorage* items = nullptr;
+    if (!ProbeField(self, &items)) return true;
+    return !items || items->empty();
+}
+std::size_t APS5_VABI _ZNK3sce4Json5Array4sizeEv(const Array* self) {
+    ArrayStorage* items = nullptr;
+    if (!ProbeField(self, &items)) return 0;
+    return items ? items->size() : 0;
+}
 void APS5_VABI _ZN3sce4Json5Array5clearEv(Array* self) {
-    if (!self->items) return;
-    self->items->clear();
+    ArrayStorage* items = nullptr;
+    if (!ProbeField(self, &items) || !items) return;
+    items->clear();
 }
 const Value* APS5_VABI _ZNK3sce4Json5Array5frontEv(const Array* self) {
-    if (!self->items) return &Defaults(TypeNull);
-    if (!self->items->head) NotImplemented_nid_no_patch(__func__);
-    return &self->items->front();
+    ArrayStorage* items = nullptr;
+    if (!ProbeField(self, &items) || !items) return &Defaults(TypeNull);
+    if (!items->head) NotImplemented_nid_no_patch(__func__);
+    return &items->front();
 }
 const Value* APS5_VABI _ZNK3sce4Json5Array4backEv(const Array* self) {
-    if (!self->items) return &Defaults(TypeNull);
-    if (!self->items->head) return reinterpret_cast<const Value*>(16);
-    return &self->items->back();
+    ArrayStorage* items = nullptr;
+    if (!ProbeField(self, &items) || !items) return &Defaults(TypeNull);
+    if (!items->head) return reinterpret_cast<const Value*>(16);
+    return &items->back();
 }
-void APS5_VABI _ZN3sce4Json5Array8pop_backEv(Array* self) { if (self->items) self->items->PopBack(); }
+void APS5_VABI _ZN3sce4Json5Array8pop_backEv(Array* self) {
+    ArrayStorage* items = nullptr;
+    if (!ProbeField(self, &items)) return;
+    if (items) items->PopBack();
+}
 
 ArrayIterator* APS5_VABI _ZN3sce4Json5Array5eraseERKNS1_8iteratorE(ArrayIterator* result, Array* self, const ArrayIterator* position) {
-    result->state = static_cast<ArrayIteratorState*>(Allocate(sizeof(ArrayIteratorState)));
-    if (result->state) result->state->position = nullptr;
-    if (!self->items) return result;
-    if (!position || !position->state || !position->state->position || position->state->position == self->items->head) {
-        Release(result->state);
-        result->state = nullptr;
+    ArrayStorage* items = nullptr;
+    ArrayIteratorState* resultState = nullptr;
+    if (!ProbeField(result, &resultState) || !ProbeField(self, &items)) return result;
+    ArrayIteratorState* state = static_cast<ArrayIteratorState*>(Allocate(sizeof(ArrayIteratorState)));
+    if (state) state->position = nullptr;
+    if (!WriteField(result, &state)) { if (state) Release(state); return result; }
+    if (!items) return result;
+    ArrayIteratorState* positionState = nullptr;
+    if (!ProbeField(position, &positionState) || !positionState || !positionState->position || positionState->position == items->head || !items->head) {
+        Release(state);
+        ArrayIteratorState* nullState = nullptr;
+        WriteField(result, &nullState);
         NotImplemented_nid_no_patch(__func__);
     }
-    auto* link = position->state->position;
+    auto* link = positionState->position;
     auto* next = link->next;
     next->previous = link->previous;
     link->previous->next = next;
     Destroy(link->value);
     Release(link);
-    --self->items->count;
+    --items->count;
     if (next) {
-        if (result->state) result->state->position = next;
+        if (state) state->position = next;
     } else {
-        Release(result->state);
-        result->state = nullptr;
+        if (state) Release(state);
+        ArrayIteratorState* nullState = nullptr;
+        WriteField(result, &nullState);
     }
     return result;
 }
 
 void APS5_VABI _ZN3sce4Json5Array9pop_frontEv(Array* self) {
-    if (!self->items || !self->items->head) NotImplemented_nid_no_patch(__func__);
-    if (self->items->empty()) return;
-    auto* link = self->items->head->next;
-    self->items->head->next = link->next;
-    link->next->previous = self->items->head;
+    ArrayStorage* items = nullptr;
+    if (!ProbeField(self, &items)) return;
+    if (!items || !items->head) NotImplemented_nid_no_patch(__func__);
+    if (items->empty()) return;
+    auto* link = items->head->next;
+    items->head->next = link->next;
+    link->next->previous = items->head;
     Destroy(link->value);
     Release(link);
-    --self->items->count;
+    --items->count;
 }
-void APS5_VABI _ZN3sce4Json5Array8iteratorD1Ev(ArrayIterator* self) { Release(self->state); self->state = nullptr; }
+void APS5_VABI _ZN3sce4Json5Array8iteratorD1Ev(ArrayIterator* self) {
+    ArrayIteratorState* state = nullptr;
+    if (!ProbeField(self, &state)) return;
+    if (state) Release(state);
+    ArrayIteratorState* nullState = nullptr;
+    WriteField(self, &nullState);
+}
 ArrayIterator* APS5_VABI _ZN3sce4Json5Array8iteratorppEv(ArrayIterator* self) {
-    if (self->state && self->state->position) self->state->position = self->state->position->next;
+    ArrayIteratorState* state = nullptr;
+    if (!ProbeField(self, &state)) return self;
+    if (state && state->position) state->position = state->position->next;
     return self;
 }
 Value* APS5_VABI _ZNK3sce4Json5Array8iteratordeEv(const ArrayIterator* self) {
-    if (!self->state) return const_cast<Value*>(&Defaults(TypeNull));
-    return reinterpret_cast<Value*>(reinterpret_cast<std::uintptr_t>(self->state->position) + 16);
+    ArrayIteratorState* state = nullptr;
+    if (!ProbeField(self, &state) || !state) return const_cast<Value*>(&Defaults(TypeNull));
+    return reinterpret_cast<Value*>(reinterpret_cast<std::uintptr_t>(state->position) + 16);
 }
 Value* APS5_VABI _ZNK3sce4Json5Array8iteratorptEv(const ArrayIterator* self) { return _ZNK3sce4Json5Array8iteratordeEv(self); }
 bool APS5_VABI _ZNK3sce4Json5Array8iteratorneERKS2_(const ArrayIterator* self, const ArrayIterator* other) {
-    return self->state && other->state && self->state->position != other->state->position;
+    ArrayIteratorState* selfState = nullptr;
+    ArrayIteratorState* otherState = nullptr;
+    if (!ProbeField(self, &selfState) || !ProbeField(other, &otherState)) return false;
+    return selfState && otherState && selfState->position != otherState->position;
 }
 void APS5_VABI _ZN3sce4Json5Array8iteratorC1ERKS2_(ArrayIterator* self, const ArrayIterator* other) {
-    self->state = other->state ? static_cast<ArrayIteratorState*>(Allocate(sizeof(ArrayIteratorState))) : nullptr;
-    if (self->state) *self->state = *other->state;
+    ArrayIteratorState* selfState = nullptr;
+    ArrayIteratorState* otherState = nullptr;
+    if (!ProbeField(self, &selfState) || !ProbeField(other, &otherState)) return;
+    ArrayIteratorState* state = nullptr;
+    if (otherState) {
+        state = static_cast<ArrayIteratorState*>(Allocate(sizeof(ArrayIteratorState)));
+        if (state) *state = *otherState;
+    }
+    if (!WriteField(self, &state) && state) Release(state);
 }
 void APS5_VABI _ZN3sce4Json5Array8iterator7advanceEm(ArrayIterator* self, std::size_t count) {
-    if (!self->state || !self->state->position || !count) return;
-    auto* start = self->state->position;
+    ArrayIteratorState* state = nullptr;
+    if (!ProbeField(self, &state)) return;
+    if (!state || !state->position || !count) return;
+    auto* start = state->position;
     auto* node = start;
     std::size_t traversed = 0;
     do {
@@ -3846,39 +4102,100 @@ void APS5_VABI _ZN3sce4Json5Array8iterator7advanceEm(ArrayIterator* self, std::s
         ++traversed;
     } while (node && node != start && traversed < count);
     if (node == start) count %= traversed;
-    else { self->state->position = node; return; }
+    else { state->position = node; return; }
     while (count--) node = node->next;
-    self->state->position = node;
+    state->position = node;
 }
 
-void APS5_VABI _ZN3sce4Json6ObjectC1Ev(Object* self) { Construct(*self); }
-void APS5_VABI _ZN3sce4Json6ObjectC1ERKS1_(Object* self, const Object* other) { CopyObject(*self, *other); }
-void APS5_VABI _ZN3sce4Json6ObjectD1Ev(Object* self) { Destroy(*self); }
+void APS5_VABI _ZN3sce4Json6ObjectC1Ev(Object* self) {
+    void* existing = nullptr;
+    if (!ProbeField(self, &existing)) return;
+    Object local{};
+    Construct(local);
+    if (!WriteField(self, &local.items)) Destroy(local);
+}
+void APS5_VABI _ZN3sce4Json6ObjectC1ERKS1_(Object* self, const Object* other) {
+    ObjectStorage* selfItems = nullptr;
+    ObjectStorage* otherItems = nullptr;
+    if (!ProbeField(self, &selfItems) || !ProbeField(other, &otherItems)) return;
+    if (!otherItems) {
+        ObjectStorage* nullItems = nullptr;
+        WriteField(self, &nullItems);
+        return;
+    }
+    Object local{};
+    local.items = static_cast<ObjectStorage*>(Allocate(ModernValues() ? 32 : 24));
+    if (!local.items) {
+        ObjectStorage* nullItems = nullptr;
+        WriteField(self, &nullItems);
+        return;
+    }
+    local.items->count = 0;
+    local.items->head = NewObjectHead();
+    local.items->SetOwner(nullptr);
+    if (ProbePayloadObject(otherItems)) CopyObjectStorage(*local.items, *otherItems);
+    if (!WriteField(self, &local.items)) Destroy(local);
+}
+void APS5_VABI _ZN3sce4Json6ObjectD1Ev(Object* self) {
+    ObjectStorage* items = nullptr;
+    if (!ProbeField(self, &items) || !items || !ProbePayloadObject(items)) return;
+    ReleaseObjectStorage(items, self);
+    ObjectStorage* nullItems = nullptr;
+    WriteField(self, &nullItems);
+}
 Object* APS5_VABI _ZN3sce4Json6ObjectaSERKS1_(Object* self, const Object* other) {
-    AssignObject(*self, *other);
+    ObjectStorage* selfItems = nullptr;
+    ObjectStorage* otherItems = nullptr;
+    if (!ProbeField(self, &selfItems) || !ProbeField(other, &otherItems)) return self;
+    if (!selfItems || !otherItems) return self;
+    if (!ProbePayloadObject(selfItems) || !ProbePayloadObject(otherItems)) return self;
+    Object local{selfItems};
+    AssignObject(local, Object{otherItems});
+    WriteField(self, &local.items);
     return self;
 }
-void APS5_VABI _ZN3sce4Json6Object5clearEv(Object* self) { if (self->items) self->items->clear(); }
-Value* APS5_VABI _ZN3sce4Json6ObjectixERKNS0_6StringE(Object* self, const String* key) { return ObjectAccess(*self, *key); }
+void APS5_VABI _ZN3sce4Json6Object5clearEv(Object* self) {
+    ObjectStorage* items = nullptr;
+    if (!ProbeField(self, &items) || !items) return;
+    items->clear();
+}
+Value* APS5_VABI _ZN3sce4Json6ObjectixERKNS0_6StringE(Object* self, const String* key) { return ObjectAccessProbed(self, key); }
 ObjectIterator* APS5_VABI _ZNK3sce4Json6Object5beginEv(ObjectIterator* result, const Object* self) {
-    result->state = static_cast<ObjectIteratorState*>(Allocate(sizeof(ObjectIteratorState)));
-    if (result->state) result->state->position = self->items && self->items->head ? self->items->head->left : nullptr;
-    if (self->items && (!self->items->head || !self->items->head->left)) { Release(result->state); result->state = nullptr; }
+    ObjectStorage* items = nullptr;
+    ObjectIteratorState* resultState = nullptr;
+    if (!ProbeField(self, &items) || !ProbeField(result, &resultState)) return result;
+    ObjectIteratorState* state = static_cast<ObjectIteratorState*>(Allocate(sizeof(ObjectIteratorState)));
+    if (state) state->position = items && items->head ? items->head->left : nullptr;
+    if (items && (!items->head || !items->head->left)) { Release(state); state = nullptr; }
+    if (!WriteField(result, &state) && state) Release(state);
     return result;
 }
 ObjectIterator* APS5_VABI _ZNK3sce4Json6Object3endEv(ObjectIterator* result, const Object* self) {
-    result->state = static_cast<ObjectIteratorState*>(Allocate(sizeof(ObjectIteratorState)));
-    if (result->state) result->state->position = self->items ? self->items->head : nullptr;
-    if (self->items && !self->items->head) { Release(result->state); result->state = nullptr; }
+    ObjectStorage* items = nullptr;
+    ObjectIteratorState* resultState = nullptr;
+    if (!ProbeField(self, &items) || !ProbeField(result, &resultState)) return result;
+    ObjectIteratorState* state = static_cast<ObjectIteratorState*>(Allocate(sizeof(ObjectIteratorState)));
+    if (state) state->position = items ? items->head : nullptr;
+    if (items && !items->head) { Release(state); state = nullptr; }
+    if (!WriteField(result, &state) && state) Release(state);
     return result;
 }
-void APS5_VABI _ZN3sce4Json6Object8iteratorD1Ev(ObjectIterator* self) { Release(self->state); self->state = nullptr; }
+void APS5_VABI _ZN3sce4Json6Object8iteratorD1Ev(ObjectIterator* self) {
+    ObjectIteratorState* state = nullptr;
+    if (!ProbeField(self, &state)) return;
+    if (state) Release(state);
+    ObjectIteratorState* nullState = nullptr;
+    WriteField(self, &nullState);
+}
 ObjectIterator* APS5_VABI _ZN3sce4Json6Object8iteratorppEv(ObjectIterator* self) {
-    if (self->state) self->state->position = NextObjectLink(self->state->position);
+    ObjectIteratorState* state = nullptr;
+    if (!ProbeField(self, &state)) return self;
+    if (state) state->position = NextObjectLink(state->position);
     return self;
 }
 Pair* APS5_VABI _ZNK3sce4Json6Object8iteratordeEv(const ObjectIterator* self) {
-    if (self->state) return reinterpret_cast<Pair*>(reinterpret_cast<std::uintptr_t>(self->state->position) + 48);
+    ObjectIteratorState* state = nullptr;
+    if (ProbeField(self, &state) && state) return reinterpret_cast<Pair*>(reinterpret_cast<std::uintptr_t>(state->position) + 48);
     const auto* object = Defaults(TypeObject).object;
     if (!object || !object->items) NotImplemented_nid_no_patch(__func__);
     ObjectIterator fallback{};
@@ -3890,29 +4207,73 @@ Pair* APS5_VABI _ZNK3sce4Json6Object8iteratordeEv(const ObjectIterator* self) {
 }
 Pair* APS5_VABI _ZNK3sce4Json6Object8iteratorptEv(const ObjectIterator* self) { return _ZNK3sce4Json6Object8iteratordeEv(self); }
 ObjectIterator* APS5_VABI _ZNK3sce4Json6Object4findERKNS0_6StringE(ObjectIterator* result, const Object* self, const String* key) {
-    result->state = static_cast<ObjectIteratorState*>(Allocate(sizeof(ObjectIteratorState)));
-    if (result->state) result->state->position = self->items && key->text ? self->items->Find(Characters(*key)) : nullptr;
-    if (self->items && key->text && !self->items->head) { Release(result->state); result->state = nullptr; }
+    ObjectStorage* items = nullptr;
+    ObjectIteratorState* resultState = nullptr;
+    if (!ProbeField(self, &items) || !ProbeField(result, &resultState)) return result;
+    Text* keyText = nullptr;
+    const bool keyReadable = ProbeSelf(key, keyText) && keyText;
+    std::string keyBytes;
+    if (keyReadable) {
+        Text keyHeader{};
+        if (ProbeHeader(keyText, keyHeader)) {
+            const auto characters = ProbeZCharacters(keyHeader);
+            if (characters) keyBytes = std::move(*characters);
+        }
+    }
+    ObjectIteratorState* state = static_cast<ObjectIteratorState*>(Allocate(sizeof(ObjectIteratorState)));
+    if (state) state->position = items && keyReadable ? (keyBytes.empty() ? items->Find("") : items->Find(keyBytes.c_str())) : nullptr;
+    if (items && keyReadable && !items->head) { Release(state); state = nullptr; }
+    if (!WriteField(result, &state) && state) Release(state);
     return result;
 }
 bool APS5_VABI _ZNK3sce4Json6Object8iteratoreqERKS2_(const ObjectIterator* self, const ObjectIterator* other) {
-    return self->state && other->state && self->state->position == other->state->position;
+    ObjectIteratorState* selfState = nullptr;
+    ObjectIteratorState* otherState = nullptr;
+    if (!ProbeField(self, &selfState) || !ProbeField(other, &otherState)) return false;
+    return selfState && otherState && selfState->position == otherState->position;
 }
 bool APS5_VABI _ZNK3sce4Json6Object8iteratorneERKS2_(const ObjectIterator* self, const ObjectIterator* other) {
-    return self->state && other->state && self->state->position != other->state->position;
+    ObjectIteratorState* selfState = nullptr;
+    ObjectIteratorState* otherState = nullptr;
+    if (!ProbeField(self, &selfState) || !ProbeField(other, &otherState)) return false;
+    return selfState && otherState && selfState->position != otherState->position;
 }
 void APS5_VABI _ZN3sce4Json6Object8iteratorC1ERKS2_(ObjectIterator* self, const ObjectIterator* other) {
-    self->state = other->state ? static_cast<ObjectIteratorState*>(Allocate(sizeof(ObjectIteratorState))) : nullptr;
-    if (self->state) *self->state = *other->state;
+    ObjectIteratorState* selfState = nullptr;
+    ObjectIteratorState* otherState = nullptr;
+    if (!ProbeField(self, &selfState) || !ProbeField(other, &otherState)) return;
+    ObjectIteratorState* state = nullptr;
+    if (otherState) {
+        state = static_cast<ObjectIteratorState*>(Allocate(sizeof(ObjectIteratorState)));
+        if (state) *state = *otherState;
+    }
+    if (!WriteField(self, &state) && state) Release(state);
 }
 void APS5_VABI _ZN3sce4Json6Object8iterator7advanceEm(ObjectIterator* self, std::size_t count) {
-    if (self->state) while (count--) self->state->position = NextObjectLink(self->state->position);
+    ObjectIteratorState* state = nullptr;
+    if (!ProbeField(self, &state)) return;
+    if (state) while (count--) state->position = NextObjectLink(state->position);
 }
-bool APS5_VABI _ZNK3sce4Json6Object5emptyEv(const Object* self) { return !self->items || self->items->empty(); }
-std::size_t APS5_VABI _ZNK3sce4Json6Object4sizeEv(const Object* self) { return self->items ? self->items->size() : 0; }
+bool APS5_VABI _ZNK3sce4Json6Object5emptyEv(const Object* self) {
+    ObjectStorage* items = nullptr;
+    if (!ProbeField(self, &items)) return true;
+    return !items || items->empty();
+}
+std::size_t APS5_VABI _ZNK3sce4Json6Object4sizeEv(const Object* self) {
+    ObjectStorage* items = nullptr;
+    if (!ProbeField(self, &items)) return 0;
+    return items ? items->size() : 0;
+}
 void APS5_VABI _ZN3sce4Json6Object5eraseERKNS0_6StringE(Object* self, const String* key) {
-    if (!self->items || !key->text) return;
-    self->items->Erase(self->items->Find(Characters(*key)));
+    ObjectStorage* items = nullptr;
+    if (!ProbeField(self, &items) || !items) return;
+    Text* keyText = nullptr;
+    if (!ProbeSelf(key, keyText) || !keyText) return;
+    Text keyHeader{};
+    if (!ProbeHeader(keyText, keyHeader)) return;
+    const auto characters = ProbeZCharacters(keyHeader);
+    if (!characters) return;
+    items->Erase(items->Find(characters->c_str()));
 }
 
 void APS5_VABI _ZN3sce4Json5ValueC1Ev(Value* self) {
@@ -4584,52 +4945,103 @@ bool APS5_VABI _ZNK3sce4Json5ValuecvbEv(const Value* self) {
 }
 
 void APS5_VABI _ZN3sce4Json6Object4PairC1ERKNS0_6StringERKNS0_5ValueE(Pair* self, const String* key, const Value* value) {
-    Construct(self->key, *key);
-    CopyInto(self->value, *value);
+    void* existingKey = nullptr;
+    Node existingValue{};
+    if (!ProbeField(&self->key, &existingKey) || !ProbeNode(&self->value, existingValue)) return;
+    ConstructProbed(&self->key, key);
+    Node destination{};
+    ProbeNode(&self->value, destination);
+    Construct(destination);
+    Node valueNode{};
+    ProbeNode(value, valueNode);
+    AssignNodeProbed(destination, valueNode, &self->value, value);
+    if (WriteNode(&self->value, destination)) {
+        if (destination.auxiliary && destination.auxiliary->fallback) destination.auxiliary->fallback->parent = &self->value;
+    }
 }
 
 void APS5_VABI _ZN3sce4Json6Object4PairD1Ev(Pair* self) {
-    Destroy(self->value);
-    Destroy(self->key);
+    Node value{};
+    if (ProbeNode(&self->value, value)) {
+        ClearProbed(value);
+        {
+            auto& state = State();
+            std::lock_guard lock(state.mutex);
+            if (state.recoveryMutex) {
+                ReleaseValueAuxiliary(value);
+                if (!ModernValues()) EraseLegacyHandlerAt(&self->value);
+            }
+        }
+        WriteNode(&self->value, value);
+    }
+    DestroyProbed(&self->key);
 }
 
 ObjectIterator* APS5_VABI _ZN3sce4Json6Object6insertERKNS1_4PairE(ObjectIterator* result, Object* self, const Pair* pair) {
-    result->state = static_cast<ObjectIteratorState*>(Allocate(sizeof(ObjectIteratorState)));
-    if (result->state) result->state->position = nullptr;
-    if (!self->items) return result;
+    ObjectStorage* items = nullptr;
+    ObjectIteratorState* resultState = nullptr;
+    if (!ProbeField(result, &resultState) || !ProbeField(self, &items)) return result;
+    ObjectIteratorState* state = static_cast<ObjectIteratorState*>(Allocate(sizeof(ObjectIteratorState)));
+    if (state) state->position = nullptr;
+    if (!WriteField(result, &state)) { if (state) Release(state); return result; }
+    if (!items) return result;
+    Text* keyText = nullptr;
+    const bool keyReadable = ProbeSelf(&pair->key, keyText) && keyText;
+    std::string keyBytes;
+    bool keyUsable = false;
+    if (keyReadable) {
+        Text keyHeader{};
+        if (ProbeHeader(keyText, keyHeader)) {
+            const auto characters = ProbeCharacters(keyHeader, false);
+            if (characters) { keyBytes = std::move(*characters); keyUsable = true; }
+        }
+    }
+    std::uint32_t reserved = 0;
+    const bool pairReadable = ProbeDwordField(&pair->reserved, &reserved);
+    Node valueNode{};
+    ProbeNode(&pair->value, valueNode);
+    if (!pairReadable) return result;
+    if (keyReadable && !keyUsable) {
+        // Raw dereferences the unreadable key text and crashes; the probe
+        // contract leaves the collection untouched and the result unbound.
+        return result;
+    }
     if (!ModernValues()) {
         ObjectLink* node;
         {
-            InlineText key; key.Assign(Characters(pair->key));
-            TemporaryTreeEntry entry(key.text, *pair);
+            InlineText key; key.Assign(keyUsable ? std::string_view{keyBytes} : std::string_view{});
+            TemporaryTreeEntryProbed entry(key.text, keyReadable, keyBytes, valueNode, &pair->value, reserved);
             bool inserted;
-            node = self->items->Insert(entry.key.text, entry.pair, inserted);
+            node = items->Insert(entry.key.text, entry.pair, inserted);
         }
-        if (!node) { Release(result->state); result->state = nullptr; }
-        else if (result->state) result->state->position = node;
+        if (!node) { if (state) Release(state); ObjectIteratorState* nullState = nullptr; WriteField(result, &nullState); }
+        else if (state) state->position = node;
         return result;
     }
     ScopedValue value;
-    value.value.parent = self->items->Owner();
-    AssignNode(value.value, pair->value);
+    value.value.parent = items->Owner();
+    AssignNodeProbed(value.value, valueNode, &value.value, &pair->value);
     AllocationOperation operation;
     ObjectLink* node;
     bool inserted;
     {
-        InlineText key; key.Assign(Characters(pair->key));
-        ScopedString copiedKey(pair->key);
-        Pair source{}; source.key = copiedKey.string;
+        InlineText key; key.Assign(keyUsable ? std::string_view{keyBytes} : std::string_view{});
+        String copiedKey{};
+        if (keyUsable) Construct(copiedKey, keyBytes);
+        Pair source{};
+        if (keyUsable) source.key = copiedKey;
         TemporaryTreeEntry entry(key.text, source);
-        node = self->items->Insert(entry.key.text, entry.pair, inserted);
+        node = items->Insert(entry.key.text, entry.pair, inserted);
+        if (copiedKey.text) Destroy(copiedKey);
     }
     const bool failed = operation.Finish();
     if (inserted && !failed) {
         TransferPayload(node->pair.value, value.value);
-        node->pair.value.parent = self->items->Owner();
+        node->pair.value.parent = items->Owner();
         BindChildren(node->pair.value);
     }
-    if (!node) { Release(result->state); result->state = nullptr; }
-    else if (result->state) result->state->position = node;
+    if (!node) { if (state) Release(state); ObjectIteratorState* nullState = nullptr; WriteField(result, &nullState); }
+    else if (state) state->position = node;
     return result;
 }
 
@@ -4638,16 +5050,26 @@ ArrayIterator* APS5_VABI _ZN3sce4Json5Array8iteratorppEi(ArrayIterator* self, in
 }
 
 ArrayIterator* APS5_VABI _ZN3sce4Json5Array8iteratoraSERKS2_(ArrayIterator* self, const ArrayIterator* other) {
-    if (self->state) {
-        if (other->state && other->state->position) *self->state = *other->state;
-        else { Release(self->state); self->state = nullptr; }
+    ArrayIteratorState* selfState = nullptr;
+    ArrayIteratorState* otherState = nullptr;
+    if (!ProbeField(self, &selfState) || !ProbeField(other, &otherState)) return self;
+    if (selfState) {
+        if (otherState && otherState->position) *selfState = *otherState;
+        else {
+            Release(selfState);
+            ArrayIteratorState* nullState = nullptr;
+            WriteField(self, &nullState);
+        }
     }
     return self;
 }
 
 void APS5_VABI _ZN3sce4Json5Array8iteratorC1Ev(ArrayIterator* self) {
-    self->state = static_cast<ArrayIteratorState*>(Allocate(sizeof(ArrayIteratorState)));
-    if (self->state) self->state->position = nullptr;
+    ArrayIteratorState* selfState = nullptr;
+    if (!ProbeField(self, &selfState)) return;
+    ArrayIteratorState* state = static_cast<ArrayIteratorState*>(Allocate(sizeof(ArrayIteratorState)));
+    if (state) state->position = nullptr;
+    if (!WriteField(self, &state) && state) Release(state);
 }
 
 ObjectIterator* APS5_VABI _ZN3sce4Json6Object8iteratorppEi(ObjectIterator* self, int) {
@@ -4655,26 +5077,37 @@ ObjectIterator* APS5_VABI _ZN3sce4Json6Object8iteratorppEi(ObjectIterator* self,
 }
 
 ObjectIterator* APS5_VABI _ZN3sce4Json6Object8iteratoraSERKS2_(ObjectIterator* self, const ObjectIterator* other) {
-    if (self->state) {
-        if (other->state && other->state->position) *self->state = *other->state;
-        else { Release(self->state); self->state = nullptr; }
+    ObjectIteratorState* selfState = nullptr;
+    ObjectIteratorState* otherState = nullptr;
+    if (!ProbeField(self, &selfState) || !ProbeField(other, &otherState)) return self;
+    if (selfState) {
+        if (otherState && otherState->position) *selfState = *otherState;
+        else {
+            Release(selfState);
+            ObjectIteratorState* nullState = nullptr;
+            WriteField(self, &nullState);
+        }
     }
     return self;
 }
 
 void APS5_VABI _ZN3sce4Json6Object8iteratorC1Ev(ObjectIterator* self) {
-    self->state = static_cast<ObjectIteratorState*>(Allocate(sizeof(ObjectIteratorState)));
-    if (self->state) self->state->position = nullptr;
+    ObjectIteratorState* selfState = nullptr;
+    if (!ProbeField(self, &selfState)) return;
+    ObjectIteratorState* state = static_cast<ObjectIteratorState*>(Allocate(sizeof(ObjectIteratorState)));
+    if (state) state->position = nullptr;
+    if (!WriteField(self, &state) && state) Release(state);
 }
 
 void APS5_VABI _ZN3sce4Json6Object4PairC1Ev(Pair* self) {
-    Construct(self->key, std::string_view{});
-    try {
-        Construct(self->value);
-    } catch (...) {
-        Destroy(self->key);
-        throw;
-    }
+    void* existingKey = nullptr;
+    Node existingValue{};
+    if (!ProbeField(&self->key, &existingKey) || !ProbeNode(&self->value, existingValue)) return;
+    ConstructProbed(&self->key, std::string_view{});
+    Node value{};
+    ProbeNode(&self->value, value);
+    Construct(value);
+    WriteNode(&self->value, value);
 }
 
 void APS5_VABI _ZN3sce4Json11InitializerC2Ev(void* self) { _ZN3sce4Json11InitializerC1Ev(self); }
