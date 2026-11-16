@@ -581,6 +581,81 @@ std::optional<Text> ProbeStringHeader(const String* self) {
     return header;
 }
 
+// Reads a Value payload's String handle target into a host String whose
+// header pointer can feed the probed String operations.
+bool ProbePayloadString(const String* handle, String& host) {
+    if (!handle) return false;
+    host = String{};
+    RestoreErrno restore;
+    return GuestCopyIn_nid_no_patch(&host.text, handle, sizeof(host.text));
+}
+
+bool OwnsPayload(const Node& owner, std::uintptr_t payload);
+void DestroyProbed(String* self);
+void Destroy(Value& value);
+template<typename T> void Destroy(T*& pointer);
+template<typename T, typename... TArgs> void Construct(T*& destination, const TArgs&... arguments);
+void BindChildren(Node& n);
+void AssignReal(Node& n, double value);
+void AssignArray(Array& destination, const Array& source);
+void AssignObject(Object& destination, const Object& source);
+bool ChainContainsProbed(const void* node, const void* destination);
+void CopyLegacyHandlerAt(const void* destination, const void* source);
+
+// Validates that a guest payload object starts at readable memory before the
+// pointer reaches the raw storage machinery.
+bool ProbePayloadObject(const void* handle) {
+    if (!handle) return false;
+    char probe = 0;
+    RestoreErrno restore;
+    return GuestCopyIn_nid_no_patch(&probe, handle, sizeof(probe));
+}
+
+// HasPayloadStorage with the first payload dereference checked.
+bool HasPayloadStorageProbed(const Node& value) {
+    if (value.type < TypeString) return true;
+    const void* handle = value.type == TypeString ? static_cast<const void*>(value.string)
+        : value.type == TypeArray ? static_cast<const void*>(value.array) : static_cast<const void*>(value.object);
+    if (!handle || !ProbePayloadObject(handle)) return false;
+    void* storage = nullptr;
+    RestoreErrno restore;
+    if (!GuestCopyIn_nid_no_patch(&storage, handle, sizeof(storage))) return false;
+    return value.type == TypeString ? storage != nullptr : storage != nullptr;
+}
+
+// OwnsPayload with the destination's first payload dereference checked; the
+// recursive tree walk keeps the existing raw handling.
+bool OwnsPayloadProbed(const Node& owner, std::uintptr_t payload) {
+    if (owner.type < TypeString || !owner.payload) return false;
+    const void* handle = owner.type == TypeString ? static_cast<const void*>(owner.string)
+        : owner.type == TypeArray ? static_cast<const void*>(owner.array) : static_cast<const void*>(owner.object);
+    if (!handle || !ProbePayloadObject(handle)) return false;
+    return OwnsPayload(owner, payload);
+}
+
+// Clear with the String payload released through checked copies and the
+// array/object storage pointers validated before the raw release walks.
+void ClearProbed(Node& node) {
+    if (node.type == TypeString && node.string) {
+        String handle{};
+        if (ProbePayloadString(node.string, handle)) {
+            DestroyProbed(&handle);
+            Release(node.string);
+        }
+        node.string = nullptr;
+    } else if (node.type == TypeArray && node.array) {
+        if (ProbePayloadObject(node.array)) Destroy(node.array);
+        node.array = nullptr;
+    } else if (node.type == TypeObject && node.object) {
+        if (ProbePayloadObject(node.object)) Destroy(node.object);
+        node.object = nullptr;
+    }
+    node.type = TypeNull;
+}
+
+void AssignPayloadProbed(Node& destination, const Node& source, const void* ownerAddress);
+
+
 bool WriteHeader(Text* pointer, const Text& header) {
     if (!pointer) return false;
     RestoreErrno restore;
@@ -2440,7 +2515,7 @@ void PrepareValueAdmission(Value& value, const Value* parent) {
     }
 }
 
-void AppendLegacyReal(String& output, double value) {
+std::string LegacyRealText(double value) {
     float magnitude = static_cast<float>(value);
     const bool negative = magnitude < 0;
     if (negative) magnitude = -magnitude;
@@ -2465,7 +2540,11 @@ void AppendLegacyReal(String& output, double value) {
     do { whole[length++] = static_cast<char>('0' + remaining % 10); remaining /= 10; } while (remaining);
     while (length) *cursor++ = whole[--length];
     if (nonzero) { *cursor++ = '.'; std::memcpy(cursor, digits, sizeof(digits)); cursor += sizeof(digits); }
-    AppendText(output, std::string_view(text, cursor - text));
+    return std::string(text, static_cast<std::size_t>(cursor - text));
+}
+
+void AppendLegacyReal(String& output, double value) {
+    AppendText(output, LegacyRealText(value));
 }
 
 class CallbackSerializer {
@@ -2898,6 +2977,422 @@ void* const JsonMemAllocatorVtable[] = {
 };
 
 }
+
+namespace {
+
+// Probed guest-pointer access for the public Value API. Every dereference of
+// a caller-supplied Value object goes through checked copies; mutations run
+// against a host snapshot and write the final state back with checked stores.
+// Allocator-owned payload storage keeps its existing raw handling.
+static_assert(sizeof(Value) == 32 && offsetof(Value, payload) == 16);
+
+bool ProbeNode(const void* address, Node& node) {
+    if (!address) return false;
+    RestoreErrno restore;
+    return GuestCopyIn_nid_no_patch(&node, address, sizeof(node));
+}
+
+bool WriteNode(void* address, const Node& node) {
+    if (!address) return false;
+    RestoreErrno restore;
+    return GuestCopyOut_nid_no_patch(address, &node, sizeof(node));
+}
+
+bool WriteNodePayload(void* address, const void* bytes) {
+    if (!address) return false;
+    RestoreErrno restore;
+    return GuestCopyOut_nid_no_patch(static_cast<std::byte*>(address) + offsetof(Value, payload), bytes, sizeof(std::uint64_t));
+}
+
+// Checked root walk: follows offset-zero parent fields and returns the root
+// node address without dereferencing it, or nullptr when a link cannot be
+// read. Raw RootOf would fault on a guest-resident ancestor.
+const void* RootOfProbed(const void* node) {
+    const void* root = node;
+    while (root) {
+        const void* parent = nullptr;
+        RestoreErrno restore;
+        if (!GuestCopyIn_nid_no_patch(&parent, root, sizeof(parent))) return nullptr;
+        if (!parent) return root;
+        root = parent;
+    }
+    return root;
+}
+
+bool ChainContainsProbed(const void* node, const void* destination) {
+    for (const void* current = node; current;) {
+        if (current == destination) return true;
+        const void* parent = nullptr;
+        RestoreErrno restore;
+        if (!GuestCopyIn_nid_no_patch(&parent, current, sizeof(parent))) return false;
+        current = parent;
+    }
+    return false;
+}
+
+HandlerRecord<TypeMismatchHandler> LegacyHandlerOfAt(const void* address) {
+    auto& state = State();
+    KernelMutexLock lock(state.recoveryMutex);
+    if (!state.legacyHandlers) return {};
+    const auto* node = state.legacyHandlers->Find(static_cast<const Value*>(address));
+    return node->nil ? HandlerRecord<TypeMismatchHandler>{} : node->record;
+}
+
+void EraseLegacyHandlerAt(const void* address) {
+    auto& state = State();
+    if (!state.recoveryMutex) NotImplemented_nid_no_patch(__func__);
+    KernelMutexLock lock(state.recoveryMutex);
+    if (state.legacyHandlers) state.legacyHandlers->Erase(state.legacyHandlers->Find(static_cast<const Value*>(address)));
+}
+
+int RegisterLegacyHandlerAt(const void* address, TypeMismatchHandler callback, void* context) {
+    auto& state = State();
+    KernelMutexLock lock(state.recoveryMutex);
+    if (!state.legacyHandlers) {
+        auto* map = static_cast<LegacyHandlerMap*>(Allocate(sizeof(LegacyHandlerMap)));
+        if (!map) return JsonErrorOutOfMemory;
+        map->count = 0;
+        map->head = static_cast<LegacyHandlerNode*>(_Znwm_nid_postfix(sizeof(LegacyHandlerNode)));
+        map->head->parent = map->head; map->head->left = map->head; map->head->right = map->head;
+        map->head->color = 0; map->head->nil = 1;
+        state.legacyHandlers = map;
+    }
+    AllocationOperation operation;
+    auto* node = state.legacyHandlers->Insert(static_cast<const Value*>(address));
+    if (operation.Finish()) return JsonErrorOutOfMemory;
+    node->record = {callback, context};
+    return 0;
+}
+
+void CopyLegacyHandlerAt(const void* destination, const void* source) {
+    auto& state = State();
+    KernelMutexLock lock(state.recoveryMutex);
+    if (!state.legacyHandlers) return;
+    const auto* node = state.legacyHandlers->Find(static_cast<const Value*>(source));
+    if (!node->nil) {
+        const auto record = node->record;
+        RegisterLegacyHandlerAt(destination, record.callback, record.context);
+    }
+}
+
+// Reads the handlers that govern a value: the root lookup and the auxiliary
+// pointer use checked copies, the auxiliary record itself keeps the existing
+// raw handling.
+Handlers HandlersOfProbed(const void* self) {
+    const void* root = RootOfProbed(self);
+    Node rootNode{};
+    const Auxiliary* auxiliary = nullptr;
+    if (root && ProbeNode(root, rootNode)) auxiliary = rootNode.auxiliary;
+    Handlers handlers;
+    {
+        auto& state = State();
+        std::lock_guard lock(state.mutex);
+        if (state.initialized) handlers = state.handlers;
+    }
+    if (!ModernValues()) {
+        const auto record = root ? LegacyHandlerOfAt(root) : HandlerRecord<TypeMismatchHandler>{};
+        handlers.typeMismatch = record.callback;
+        handlers.typeMismatchContext = record.context;
+        return handlers;
+    }
+    if (!auxiliary) return handlers;
+    if (auxiliary->typeMismatch && auxiliary->typeMismatch->callback) {
+        handlers.typeMismatch = auxiliary->typeMismatch->callback;
+        handlers.typeMismatchContext = auxiliary->typeMismatch->context;
+    }
+    if (auxiliary->specialFloat && auxiliary->specialFloat->callback) {
+        handlers.specialFloat = auxiliary->specialFloat->callback;
+        handlers.specialFloatContext = auxiliary->specialFloat->context;
+    }
+    if (auxiliary->elementAccessFailure && auxiliary->elementAccessFailure->callback) {
+        handlers.elementAccessFailure = auxiliary->elementAccessFailure->callback;
+        handlers.elementAccessFailureContext = auxiliary->elementAccessFailure->context;
+    }
+    return handlers;
+}
+
+// Typed with the caller's snapshot standing in for the raw self reads. The
+// mismatch callbacks still receive the real self pointer.
+const Value& TypedProbed(const Value* self, const Node& snapshot, ValueType requested, bool* usedDefault = nullptr) {
+    const auto fallback = [&]() -> const Node& {
+        if (usedDefault) *usedDefault = true;
+        if (usedDefault && requested >= TypeString) return SharedDefaults().values[requested];
+        return Defaults(requested);
+    };
+    if (snapshot.type == requested ||
+            ((requested == TypeInteger || requested == TypeUInteger) &&
+             (snapshot.type == TypeInteger || snapshot.type == TypeUInteger))) return *self;
+    if (!ModernValues() && snapshot.type == TypeNull) {
+        const void* root = RootOfProbed(self);
+        Node rootNode{};
+        if (root && ProbeNode(root, rootNode) && rootNode.auxiliary && rootNode.auxiliary->nullAccess)
+            return Typed(&rootNode.auxiliary->nullAccess(requested, snapshot.parent, rootNode.auxiliary->nullAccessContext), requested, usedDefault);
+    }
+    CallbackScope scope;
+    if (!scope.entered) return fallback();
+    NullAccessCallback callback = nullptr;
+    void* context = nullptr;
+    bool initialized;
+    {
+        auto& state = State();
+        std::lock_guard lock(state.mutex);
+        initialized = state.initialized;
+        callback = state.callback;
+        context = state.context;
+    }
+    if (!initialized) return fallback();
+    if (!ModernValues()) {
+        const void* root = RootOfProbed(self);
+        const auto record = root ? LegacyHandlerOfAt(root) : HandlerRecord<TypeMismatchHandler>{};
+        if (record.callback) return Typed(&record.callback(requested, self, snapshot.parent, record.context), requested, usedDefault);
+        return fallback();
+    }
+    if (snapshot.type == TypeNull) {
+        const void* root = RootOfProbed(self);
+        Node rootNode{};
+        if (root && ProbeNode(root, rootNode) && rootNode.auxiliary && rootNode.auxiliary->nullAccess)
+            return Typed(&rootNode.auxiliary->nullAccess(requested, snapshot.parent, rootNode.auxiliary->nullAccessContext), requested, usedDefault);
+    }
+    const void* root = RootOfProbed(self);
+    Node rootNode{};
+    if (root && ProbeNode(root, rootNode) && rootNode.auxiliary && rootNode.auxiliary->typeMismatch && rootNode.auxiliary->typeMismatch->callback)
+        return Typed(&rootNode.auxiliary->typeMismatch->callback(requested, self, snapshot.parent, rootNode.auxiliary->typeMismatch->context), requested, usedDefault);
+    if (snapshot.type == TypeNull && callback)
+        return Typed(&callback(requested, snapshot.parent, context), requested, usedDefault);
+    const auto handlers = HandlersOfProbed(self);
+    if (handlers.typeMismatch)
+        return Typed(&handlers.typeMismatch(requested, self, snapshot.parent, handlers.typeMismatchContext), requested, usedDefault);
+    return fallback();
+}
+
+const Value& MissingElementProbed(const Value* self, const Node& snapshot, int error, const String* key, const std::size_t* index) {
+    bool initialized;
+    {
+        auto& state = State();
+        std::lock_guard lock(state.mutex);
+        initialized = state.initialized;
+    }
+    const void* root = RootOfProbed(self);
+    Node rootNode{};
+    const Auxiliary* auxiliary = nullptr;
+    if (root && ProbeNode(root, rootNode)) auxiliary = rootNode.auxiliary;
+    if (initialized) {
+        CallbackScope scope;
+        const auto handlers = HandlersOfProbed(self);
+        if (scope.entered && handlers.elementAccessFailure &&
+                (!auxiliary || self != auxiliary->fallback) && self != &Defaults(TypeNull))
+            handlers.elementAccessFailure(error, key, index, snapshot.parent, self, handlers.elementAccessFailureContext);
+        return auxiliary && auxiliary->fallback ? *auxiliary->fallback : Defaults(TypeNull);
+    }
+    return Defaults(TypeNull);
+}
+
+// LookupKey with the key string and the self node read through checked
+// copies. Object storage traversal keeps the existing raw handling.
+const Value* LookupKeyProbed(const Value* self, const Node& snapshot, const String* key) {
+    if (!key) { NotImplemented_nid_no_patch(__func__); return nullptr; }
+    auto moduleFallback = [] {
+        auto& state = State();
+        std::lock_guard lock(state.mutex);
+        return state.fallback;
+    };
+    const auto keyHeader = ProbeStringHeader(key);
+    if (!keyHeader || !keyHeader->characters) return moduleFallback();
+    struct IteratorState {
+        ObjectIteratorState* state = static_cast<ObjectIteratorState*>(Allocate(sizeof(ObjectIteratorState)));
+        IteratorState() { if (state) state->position = nullptr; }
+        ~IteratorState() { Release(state); }
+    };
+    if (snapshot.type == TypeObject) {
+        IteratorState found;
+        if (!snapshot.object) { NotImplemented_nid_no_patch(__func__); return nullptr; }
+        auto* items = snapshot.object->items;
+        if (found.state) found.state->position = items ? items->Find(ZCharactersOrEmpty(*keyHeader).data()) : nullptr;
+        if (items && !items->head) { Release(found.state); found.state = nullptr; }
+        bool present;
+        {
+            IteratorState end;
+            if (end.state) end.state->position = items ? items->head : nullptr;
+            if (items && !items->head) { Release(end.state); end.state = nullptr; }
+            present = found.state && end.state && found.state->position != end.state->position;
+        }
+        if (present) return &found.state->position->pair.value;
+        if (ModernValues()) {
+            const auto* result = &MissingElementProbed(self, snapshot, static_cast<int>(0x80848115), key, nullptr);
+            const void* root = RootOfProbed(self);
+            Node rootNode{};
+            if (moduleFallback() || (root && ProbeNode(root, rootNode) && rootNode.auxiliary)) return result;
+        }
+    } else if (ModernValues()) {
+        const auto* result = &MissingElementProbed(self, snapshot, static_cast<int>(0x80848117), key, nullptr);
+        const void* root = RootOfProbed(self);
+        Node rootNode{};
+        if (moduleFallback() || (root && ProbeNode(root, rootNode) && rootNode.auxiliary)) return result;
+    }
+    const void* root = RootOfProbed(self);
+    Node rootNode{};
+    const Auxiliary* auxiliary = nullptr;
+    if (root && ProbeNode(root, rootNode)) auxiliary = rootNode.auxiliary;
+    return auxiliary && auxiliary->fallback ? auxiliary->fallback : moduleFallback();
+}
+
+// SetType with the destination's previous payload released through ClearProbed.
+// The freshly created storage binds to the real object: BindChildren against
+// the snapshot would leave a dangling owner behind in the guest tree.
+void SetTypeProbed(Node& node, ValueType type, const void* ownerAddress) {
+    if (node.type == type) return;
+    if (type < TypeNull || type > TypeObject) throw std::invalid_argument("sce::Json::Value::set: invalid value type");
+    ClearProbed(node);
+    if (type == TypeBoolean) node.boolean = false;
+    else if (type == TypeInteger || type == TypeUInteger || type == TypeReal) node.payload = 0;
+    else if (type == TypeString) {
+        Construct(node.string, std::string_view{});
+        if (!node.string) return;
+    } else if (type == TypeArray) {
+        Construct(node.array);
+        if (!node.array) return;
+    } else if (type == TypeObject) {
+        Construct(node.object);
+        if (!node.object) return;
+    }
+    node.type = type;
+    auto* owner = static_cast<Value*>(const_cast<void*>(ownerAddress));
+    if (node.type == TypeArray && node.array && node.array->items) {
+        node.array->items->SetOwner(owner);
+        for (auto& item : *node.array->items) item.parent = owner;
+    }
+    if (node.type == TypeObject && node.object && node.object->items) {
+        node.object->items->SetOwner(owner);
+        for (auto& pair : *node.object->items) pair.value.parent = owner;
+    }
+}
+
+
+// AssignPayload with the source payload pointers validated before the raw
+// storage walks and the destination releases routed through SetTypeProbed.
+void AssignPayloadProbed(Node& destination, const Node& source, const void* ownerAddress) {
+    if (source.type >= TypeString && HasPayloadStorageProbed(source) && destination.type != source.type && OwnsPayloadProbed(destination, source.payload)) {
+        Node temporary{};
+        try {
+            AssignPayloadProbed(temporary, source, &temporary);
+            AssignPayloadProbed(destination, temporary, ownerAddress);
+        } catch (...) { Destroy(temporary); throw; }
+        Destroy(temporary);
+        return;
+    }
+    if (source.type == TypeNull) { SetTypeProbed(destination, TypeNull, ownerAddress); return; }
+    if (source.type == TypeBoolean) {
+        const auto value = source.boolean;
+        SetTypeProbed(destination, TypeBoolean, ownerAddress);
+        destination.boolean = value;
+        return;
+    }
+    if (source.type == TypeInteger || source.type == TypeUInteger) {
+        const auto value = source.payload;
+        SetTypeProbed(destination, source.type, ownerAddress);
+        destination.payload = value;
+        return;
+    }
+    if (source.type == TypeReal) { AssignReal(destination, source.real); return; }
+    if (source.type == TypeString) {
+        const auto* string = source.string;
+        if (!string) NotImplemented_nid_no_patch(__func__);
+        if (!ProbePayloadObject(string)) return;
+        Text* text = nullptr;
+        if (!ProbeSelf(string, text) || !text) return;
+        Text sourceHeader{};
+        if (!ProbeHeader(text, sourceHeader)) return;
+        const auto characters = ProbeCharacters(sourceHeader, false);
+        SetTypeProbed(destination, TypeString, ownerAddress);
+        if (destination.type == TypeString && destination.string) {
+            Text* destinationText = nullptr;
+            if (ProbeSelf(destination.string, destinationText) && destinationText != text && characters)
+                AssignText(*destination.string, *characters, true);
+        }
+        return;
+    }
+    if (source.type == TypeArray) {
+        const auto* array = source.array;
+        if (!array) NotImplemented_nid_no_patch(__func__);
+        ArrayStorage* items = nullptr;
+        {
+            RestoreErrno restore;
+            if (!ProbePayloadObject(array) || !GuestCopyIn_nid_no_patch(&items, array, sizeof(items)) || !items) return;
+        }
+        SetTypeProbed(destination, TypeArray, ownerAddress);
+        if (destination.array) AssignArray(*destination.array, *array);
+        return;
+    }
+    if (source.type == TypeObject) {
+        const auto* object = source.object;
+        if (!object) NotImplemented_nid_no_patch(__func__);
+        ObjectStorage* items = nullptr;
+        {
+            RestoreErrno restore;
+            if (!ProbePayloadObject(object) || !GuestCopyIn_nid_no_patch(&items, object, sizeof(items)) || !items) return;
+        }
+        SetTypeProbed(destination, TypeObject, ownerAddress);
+        if (destination.object) AssignObject(*destination.object, *object);
+        return;
+    }
+    NotImplemented_nid_no_patch(__func__);
+}
+
+// AssignNode with the self-referential dance keyed by the real object
+// addresses and the source payload dereferences checked.
+void AssignNodeProbed(Node& destination, const Node& source, const void* destinationAddress, const void* sourceAddress) {
+    if (ChainContainsProbed(source.parent, destinationAddress) && HasPayloadStorageProbed(source)) {
+        Node temporary{};
+        try {
+            AssignNodeProbed(temporary, source, &temporary, sourceAddress);
+            AssignNodeProbed(destination, temporary, destinationAddress, &temporary);
+        } catch (...) { Destroy(temporary); throw; }
+        Destroy(temporary);
+        return;
+    }
+    AssignPayloadProbed(destination, source, destinationAddress);
+    if (!ModernValues()) CopyLegacyHandlerAt(destinationAddress, sourceAddress);
+}
+
+
+// Re-points the auxiliary fallback at the real object after a mutation ran
+// against a host snapshot; storage owners and child links already bind to the
+// real object where the raw machinery creates them.
+void RebindProbed(Value* self, const Node& node) {
+    if (node.auxiliary && node.auxiliary->fallback) node.auxiliary->fallback->parent = self;
+}
+
+template <typename TCallback>
+int SetHandlerProbed(Value* self, Node& node, HandlerRecord<TCallback>* Auxiliary::* member, TCallback callback, void* context, bool modernOnly = false) {
+    if (node.parent) return static_cast<int>(0x80848104);
+    const bool legacyMismatch = !ModernValues() && std::is_same_v<TCallback, TypeMismatchHandler>;
+    if (legacyMismatch && !node.auxiliary) return static_cast<int>(0x80848104);
+    {
+        auto& state = State();
+        std::lock_guard lock(state.mutex);
+        if (!state.allocation) return JsonErrorNotInitialized;
+        if (modernOnly && !state.floatFormatEnabled) return static_cast<int>(0x80848113);
+    }
+    if (!ModernValues()) {
+        if constexpr (std::is_same_v<TCallback, TypeMismatchHandler>) return RegisterLegacyHandlerAt(self, callback, context);
+        else NotImplemented_nid_no_patch(__func__);
+    }
+    const auto status = EnsureAuxiliary(node);
+    if (node.auxiliary && node.auxiliary->fallback) node.auxiliary->fallback->parent = self;
+    if (status) { WriteNode(self, node); return status; }
+    auto& record = node.auxiliary->*member;
+    if (!record) {
+        record = static_cast<HandlerRecord<TCallback>*>(Allocate(sizeof(HandlerRecord<TCallback>)));
+        if (!record) { WriteNode(self, node); return JsonErrorOutOfMemory; }
+    }
+    record->callback = callback;
+    record->context = context;
+    WriteNode(self, node);
+    if (node.auxiliary->fallback) node.auxiliary->fallback->parent = self;
+    return 0;
+}
+
+}  // namespace
 
 extern "C" {
 
@@ -3420,196 +3915,452 @@ void APS5_VABI _ZN3sce4Json6Object5eraseERKNS0_6StringE(Object* self, const Stri
     self->items->Erase(self->items->Find(Characters(*key)));
 }
 
-void APS5_VABI _ZN3sce4Json5ValueC1Ev(Value* self) { Construct(*self); }
-void APS5_VABI _ZN3sce4Json5ValueC1Eb(Value* self, bool value) { Construct(*self); self->type = TypeBoolean; self->boolean = value; }
-void APS5_VABI _ZN3sce4Json5ValueC1El(Value* self, std::int64_t value) { Construct(*self); self->type = TypeInteger; self->integer = value; }
-void APS5_VABI _ZN3sce4Json5ValueC1Em(Value* self, std::uint64_t value) { Construct(*self); self->type = TypeUInteger; self->uinteger = value; }
-void APS5_VABI _ZN3sce4Json5ValueC1Ed(Value* self, double value) { Construct(*self); AssignReal(*self, value); }
+void APS5_VABI _ZN3sce4Json5ValueC1Ev(Value* self) {
+    Node node{};
+    if (!ProbeNode(self, node)) return;
+    Construct(node);
+    WriteNode(self, node);
+}
+void APS5_VABI _ZN3sce4Json5ValueC1Eb(Value* self, bool value) {
+    Node node{};
+    if (!ProbeNode(self, node)) return;
+    Construct(node);
+    node.type = TypeBoolean;
+    node.boolean = value;
+    WriteNode(self, node);
+}
+void APS5_VABI _ZN3sce4Json5ValueC1El(Value* self, std::int64_t value) {
+    Node node{};
+    if (!ProbeNode(self, node)) return;
+    Construct(node);
+    node.type = TypeInteger;
+    node.integer = value;
+    WriteNode(self, node);
+}
+void APS5_VABI _ZN3sce4Json5ValueC1Em(Value* self, std::uint64_t value) {
+    Node node{};
+    if (!ProbeNode(self, node)) return;
+    Construct(node);
+    node.type = TypeUInteger;
+    node.uinteger = value;
+    WriteNode(self, node);
+}
+void APS5_VABI _ZN3sce4Json5ValueC1Ed(Value* self, double value) {
+    Node node{};
+    if (!ProbeNode(self, node)) return;
+    Construct(node);
+    AssignReal(node, value);
+    WriteNode(self, node);
+}
 void APS5_VABI _ZN3sce4Json5ValueC1EPKc(Value* self, const char* text) {
-    Construct(*self);
+    Node node{};
+    if (!ProbeNode(self, node)) return;
+    Construct(node);
     std::size_t length = 0;
     if (text && !GuestTextLength(text, length)) text = nullptr;
     ScopedString temporary{text ? std::string_view{text, length} : std::string_view{""}};
-    if (!temporary.string.text) return;
-    SetType(*self, TypeString);
-    if (self->type == TypeString) AssignText(*self->string, View(temporary.string), true);
+    if (!temporary.string.text) { WriteNode(self, node); return; }
+    SetTypeProbed(node, TypeString, self);
+    if (node.type == TypeString && node.string) AssignText(*node.string, View(temporary.string), true);
+    WriteNode(self, node);
 }
 void APS5_VABI _ZN3sce4Json5ValueC1ERKNS0_6StringE(Value* self, const String* text) {
-    Construct(*self);
-    if (!text->text) return;
-    SetType(*self, TypeString);
-    if (self->type == TypeString) AssignText(*self->string, View(*text), true);
+    Node node{};
+    if (!ProbeNode(self, node)) return;
+    Construct(node);
+    if (ProbePayloadObject(text)) {
+        Text* textPointer = nullptr;
+        if (!ProbeSelf(text, textPointer) || !textPointer) { WriteNode(self, node); return; }
+        SetTypeProbed(node, TypeString, self);
+        if (node.type == TypeString && node.string) {
+            Text textHeader{};
+            if (ProbeHeader(textPointer, textHeader)) {
+                if (const auto characters = ProbeCharacters(textHeader, false)) AssignText(*node.string, *characters, true);
+            }
+        }
+    }
+    WriteNode(self, node);
 }
 void APS5_VABI _ZN3sce4Json5ValueC1ERKNS0_5ArrayE(Value* self, const Array* array) {
-    Construct(*self);
-    if (!array->items) return;
-    SetType(*self, TypeArray);
-    if (self->array) AssignArray(*self->array, *array);
+    Node node{};
+    if (!ProbeNode(self, node)) return;
+    Construct(node);
+    if (array) {
+        ArrayStorage* items = nullptr;
+        {
+            RestoreErrno restore;
+            if (ProbePayloadObject(array) && GuestCopyIn_nid_no_patch(&items, array, sizeof(items)) && items) {
+                SetTypeProbed(node, TypeArray, self);
+                if (node.array) AssignArray(*node.array, *array);
+            }
+        }
+    }
+    WriteNode(self, node);
+    RebindProbed(self, node);
 }
 void APS5_VABI _ZN3sce4Json5ValueC1ERKNS0_6ObjectE(Value* self, const Object* object) {
-    Construct(*self);
-    if (!object->items) return;
-    SetType(*self, TypeObject);
-    if (self->object) AssignObject(*self->object, *object);
+    Node node{};
+    if (!ProbeNode(self, node)) return;
+    Construct(node);
+    if (object) {
+        ObjectStorage* items = nullptr;
+        {
+            RestoreErrno restore;
+            if (ProbePayloadObject(object) && GuestCopyIn_nid_no_patch(&items, object, sizeof(items)) && items) {
+                SetTypeProbed(node, TypeObject, self);
+                if (node.object) AssignObject(*node.object, *object);
+            }
+        }
+    }
+    WriteNode(self, node);
+    RebindProbed(self, node);
 }
-void APS5_VABI _ZN3sce4Json5ValueC1ERKS1_(Value* self, const Value* other) { CopyInto(*self, *other); }
-void APS5_VABI _ZN3sce4Json5ValueD1Ev(Value* self) { Destroy(*self); }
+void APS5_VABI _ZN3sce4Json5ValueC1ERKS1_(Value* self, const Value* other) {
+    Node node{};
+    if (!ProbeNode(self, node)) return;
+    Construct(node);
+    Node otherNode{};
+    if (ProbeNode(other, otherNode)) AssignNodeProbed(node, otherNode, self, other);
+    WriteNode(self, node);
+    RebindProbed(self, node);
+}
+void APS5_VABI _ZN3sce4Json5ValueD1Ev(Value* self) {
+    Node node{};
+    if (!ProbeNode(self, node)) return;
+    ClearProbed(node);
+    {
+        auto& state = State();
+        std::lock_guard lock(state.mutex);
+        if (state.recoveryMutex) {
+            ReleaseValueAuxiliary(node);
+            if (!ModernValues()) EraseLegacyHandlerAt(self);
+        }
+    }
+    WriteNode(self, node);
+}
 Value* APS5_VABI _ZN3sce4Json5ValueaSERKS1_(Value* self, const Value* other) {
-    AssignNode(NodeOf(*self), NodeOf(*other));
+    Node node{};
+    Node otherNode{};
+    if (!ProbeNode(self, node) || !ProbeNode(other, otherNode)) return self;
+    AssignNodeProbed(node, otherNode, self, other);
+    WriteNode(self, node);
+    RebindProbed(self, node);
     return self;
 }
 void APS5_VABI _ZN3sce4Json5Value4swapERS1_(Value* self, Value* other) {
-    for (auto* parent = other->parent; parent; parent = parent->parent)
-        if (parent == self) NotImplemented_nid_no_patch(__func__);
-    for (auto* parent = self->parent; parent; parent = parent->parent)
-        if (parent == other) NotImplemented_nid_no_patch(__func__);
+    Node node{};
+    Node otherNode{};
+    if (!ProbeNode(self, node) || !ProbeNode(other, otherNode)) return;
+    if (ChainContainsProbed(otherNode.parent, self)) NotImplemented_nid_no_patch(__func__);
+    if (ChainContainsProbed(node.parent, other)) NotImplemented_nid_no_patch(__func__);
     Node temporary{};
     try {
-        AssignNode(temporary, NodeOf(*self));
-        AssignNode(NodeOf(*self), NodeOf(*other));
-        AssignNode(NodeOf(*other), temporary);
+        AssignNodeProbed(temporary, node, &temporary, self);
+        AssignNodeProbed(node, otherNode, self, other);
+        AssignNodeProbed(otherNode, temporary, other, &temporary);
     } catch (...) {
         Destroy(temporary);
         throw;
     }
     Destroy(temporary);
+    WriteNode(self, node);
+    WriteNode(other, otherNode);
+    RebindProbed(self, node);
+    RebindProbed(other, otherNode);
 }
 
-void APS5_VABI _ZN3sce4Json5Value3setENS0_9ValueTypeE(Value* self, ValueType type) { SetType(NodeOf(*self), type); }
-void APS5_VABI _ZN3sce4Json5Value3setEb(Value* self, bool value) { SetType(NodeOf(*self), TypeBoolean); self->boolean = value; }
-void APS5_VABI _ZN3sce4Json5Value3setEl(Value* self, std::int64_t value) { SetType(NodeOf(*self), TypeInteger); self->integer = value; }
-void APS5_VABI _ZN3sce4Json5Value3setEm(Value* self, std::uint64_t value) { SetType(NodeOf(*self), TypeUInteger); self->uinteger = value; }
-void APS5_VABI _ZN3sce4Json5Value3setEd(Value* self, double value) { AssignReal(NodeOf(*self), value); }
+void APS5_VABI _ZN3sce4Json5Value3setENS0_9ValueTypeE(Value* self, ValueType type) {
+    Node node{};
+    if (!ProbeNode(self, node)) return;
+    SetTypeProbed(node, type, self);
+    WriteNode(self, node);
+    RebindProbed(self, node);
+}
+void APS5_VABI _ZN3sce4Json5Value3setEb(Value* self, bool value) {
+    Node node{};
+    if (!ProbeNode(self, node)) return;
+    SetType(node, TypeBoolean);
+    node.boolean = value;
+    WriteNode(self, node);
+}
+void APS5_VABI _ZN3sce4Json5Value3setEl(Value* self, std::int64_t value) {
+    Node node{};
+    if (!ProbeNode(self, node)) return;
+    SetType(node, TypeInteger);
+    node.integer = value;
+    WriteNode(self, node);
+}
+void APS5_VABI _ZN3sce4Json5Value3setEm(Value* self, std::uint64_t value) {
+    Node node{};
+    if (!ProbeNode(self, node)) return;
+    SetType(node, TypeUInteger);
+    node.uinteger = value;
+    WriteNode(self, node);
+}
+void APS5_VABI _ZN3sce4Json5Value3setEd(Value* self, double value) {
+    Node node{};
+    if (!ProbeNode(self, node)) return;
+    AssignReal(node, value);
+    WriteNode(self, node);
+}
 void APS5_VABI _ZN3sce4Json5Value3setEPKc(Value* self, const char* text) {
     if (text == nullptr) throw std::invalid_argument("sce::Json::Value::set: null text");
     std::size_t length = 0;
     if (!GuestTextLength(text, length)) throw std::invalid_argument("sce::Json::Value::set: unreadable text");
+    Node node{};
+    if (!ProbeNode(self, node)) return;
     ScopedString temporary{std::string_view{text, length}};
-    if (!temporary.string.text) return;
-    SetType(NodeOf(*self), TypeString);
-    if (self->type == TypeString) AssignText(*self->string, View(temporary.string), true);
+    if (!temporary.string.text) { WriteNode(self, node); return; }
+    SetTypeProbed(node, TypeString, self);
+    if (node.type == TypeString && node.string) AssignText(*node.string, View(temporary.string), true);
+    WriteNode(self, node);
 }
 void APS5_VABI _ZN3sce4Json5Value3setERKNS0_6StringE(Value* self, const String* text) {
-    if (!text->text) return;
+    Node node{};
+    if (!ProbeNode(self, node)) return;
+    if (!ProbePayloadObject(text)) return;
+    Text* textPointer = nullptr;
+    if (!ProbeSelf(text, textPointer) || !textPointer) return;
     Value source{};
     source.type = TypeString;
     source.string = const_cast<String*>(text);
-    AssignPayload(*self, source);
+    AssignPayloadProbed(node, source, self);
+    WriteNode(self, node);
+    RebindProbed(self, node);
 }
 void APS5_VABI _ZN3sce4Json5Value3setERKNS0_5ArrayE(Value* self, const Array* array) {
-    if (!array->items) return;
+    Node node{};
+    if (!ProbeNode(self, node)) return;
+    if (!array) return;
+    ArrayStorage* items = nullptr;
+    {
+        RestoreErrno restore;
+        if (!ProbePayloadObject(array) || !GuestCopyIn_nid_no_patch(&items, array, sizeof(items)) || !items) return;
+    }
     Value source{};
     source.type = TypeArray;
     source.array = const_cast<Array*>(array);
-    AssignPayload(*self, source);
+    AssignPayloadProbed(node, source, self);
+    WriteNode(self, node);
+    RebindProbed(self, node);
 }
 void APS5_VABI _ZN3sce4Json5Value3setERKNS0_6ObjectE(Value* self, const Object* object) {
-    if (!object->items) return;
+    Node node{};
+    if (!ProbeNode(self, node)) return;
+    if (!object) return;
+    ObjectStorage* items = nullptr;
+    {
+        RestoreErrno restore;
+        if (!ProbePayloadObject(object) || !GuestCopyIn_nid_no_patch(&items, object, sizeof(items)) || !items) return;
+    }
     Value source{};
     source.type = TypeObject;
     source.object = const_cast<Object*>(object);
-    AssignPayload(*self, source);
+    AssignPayloadProbed(node, source, self);
+    WriteNode(self, node);
+    RebindProbed(self, node);
 }
 void APS5_VABI _ZN3sce4Json5Value3setERKS1_(Value* self, const Value* other) {
-    AssignNode(NodeOf(*self), NodeOf(*other));
+    Node node{};
+    Node otherNode{};
+    if (!ProbeNode(self, node) || !ProbeNode(other, otherNode)) return;
+    AssignNodeProbed(node, otherNode, self, other);
+    WriteNode(self, node);
+    RebindProbed(self, node);
 }
 
-ValueType APS5_VABI _ZNK3sce4Json5Value7getTypeEv(const Value* self) { return NodeOf(*self).type; }
+ValueType APS5_VABI _ZNK3sce4Json5Value7getTypeEv(const Value* self) {
+    Node node{};
+    if (!ProbeNode(self, node)) return TypeNull;
+    return node.type;
+}
 const bool* APS5_VABI _ZNK3sce4Json5Value10getBooleanEv(const Value* self) {
+    Node node{};
+    if (!ProbeNode(self, node)) return &_ZN3sce4Json5Value10s_nullboolE;
+    if (node.type == TypeBoolean) return &self->boolean;
     bool usedDefault = false;
-    const auto& value = Typed(self, TypeBoolean, &usedDefault);
-    return usedDefault ? &_ZN3sce4Json5Value10s_nullboolE : &value.boolean;
+    const auto& value = TypedProbed(self, node, TypeBoolean, &usedDefault);
+    if (usedDefault) return &_ZN3sce4Json5Value10s_nullboolE;
+    return &value.boolean;
 }
 const std::int64_t* APS5_VABI _ZNK3sce4Json5Value10getIntegerEv(const Value* self) {
-    Node& n = const_cast<Node&>(NodeOf(*self));
-    if (n.type == TypeUInteger) {
-        n.integer = std::bit_cast<std::int64_t>(n.uinteger);
-        return &n.integer;
+    Node node{};
+    if (!ProbeNode(self, node)) return &_ZN3sce4Json5Value13s_nullintegerE;
+    if (node.type == TypeUInteger) {
+        const auto converted = std::bit_cast<std::int64_t>(node.uinteger);
+        RestoreErrno restore;
+        if (!GuestCopyOut_nid_no_patch(reinterpret_cast<std::byte*>(const_cast<Value*>(self)) + offsetof(Value, payload), &converted, sizeof(converted)))
+            return &_ZN3sce4Json5Value13s_nullintegerE;
+        return &self->integer;
     }
+    if (node.type == TypeInteger) return &self->integer;
     bool usedDefault = false;
-    const auto& value = Typed(self, TypeInteger, &usedDefault);
-    return usedDefault ? &_ZN3sce4Json5Value13s_nullintegerE : &value.integer;
+    const auto& value = TypedProbed(self, node, TypeInteger, &usedDefault);
+    if (usedDefault) return &_ZN3sce4Json5Value13s_nullintegerE;
+    return &value.integer;
 }
 const std::uint64_t* APS5_VABI _ZNK3sce4Json5Value11getUIntegerEv(const Value* self) {
-    Node& n = const_cast<Node&>(NodeOf(*self));
-    if (n.type == TypeInteger) {
-        n.uinteger = static_cast<std::uint64_t>(n.integer);
-        return &n.uinteger;
+    Node node{};
+    if (!ProbeNode(self, node)) return &_ZN3sce4Json5Value14s_nulluintegerE;
+    if (node.type == TypeInteger) {
+        const std::uint64_t converted = static_cast<std::uint64_t>(node.integer);
+        RestoreErrno restore;
+        if (!GuestCopyOut_nid_no_patch(reinterpret_cast<std::byte*>(const_cast<Value*>(self)) + offsetof(Value, payload), &converted, sizeof(converted)))
+            return &_ZN3sce4Json5Value14s_nulluintegerE;
+        return &self->uinteger;
     }
+    if (node.type == TypeUInteger) return &self->uinteger;
     bool usedDefault = false;
-    const auto& value = Typed(self, TypeUInteger, &usedDefault);
-    return usedDefault ? &_ZN3sce4Json5Value14s_nulluintegerE : &value.uinteger;
+    const auto& value = TypedProbed(self, node, TypeUInteger, &usedDefault);
+    if (usedDefault) return &_ZN3sce4Json5Value14s_nulluintegerE;
+    return &value.uinteger;
 }
 const double* APS5_VABI _ZNK3sce4Json5Value7getRealEv(const Value* self) {
+    Node node{};
+    if (!ProbeNode(self, node)) return &_ZN3sce4Json5Value10s_nullrealE;
+    if (node.type == TypeReal) return &self->real;
     bool usedDefault = false;
-    const auto& value = Typed(self, TypeReal, &usedDefault);
-    return usedDefault ? &_ZN3sce4Json5Value10s_nullrealE : &value.real;
+    const auto& value = TypedProbed(self, node, TypeReal, &usedDefault);
+    if (usedDefault) return &_ZN3sce4Json5Value10s_nullrealE;
+    return &value.real;
 }
-const String* APS5_VABI _ZNK3sce4Json5Value9getStringEv(const Value* self) { bool fallback = false; const auto& value = Typed(self, TypeString, &fallback); return fallback ? _ZN3sce4Json5Value12s_nullstringE : value.string; }
-const Array* APS5_VABI _ZNK3sce4Json5Value8getArrayEv(const Value* self) { bool fallback = false; const auto& value = Typed(self, TypeArray, &fallback); return fallback ? _ZN3sce4Json5Value11s_nullarrayE : value.array; }
-const Object* APS5_VABI _ZNK3sce4Json5Value9getObjectEv(const Value* self) { bool fallback = false; const auto& value = Typed(self, TypeObject, &fallback); return fallback ? _ZN3sce4Json5Value12s_nullobjectE : value.object; }
+const String* APS5_VABI _ZNK3sce4Json5Value9getStringEv(const Value* self) {
+    Node node{};
+    if (!ProbeNode(self, node)) return _ZN3sce4Json5Value12s_nullstringE;
+    if (node.type == TypeString) return node.string;
+    bool usedDefault = false;
+    const auto& value = TypedProbed(self, node, TypeString, &usedDefault);
+    if (usedDefault) return _ZN3sce4Json5Value12s_nullstringE;
+    Node valueNode{};
+    if (ProbeNode(&value, valueNode) && valueNode.type == TypeString) return valueNode.string;
+    return _ZN3sce4Json5Value12s_nullstringE;
+}
+const Array* APS5_VABI _ZNK3sce4Json5Value8getArrayEv(const Value* self) {
+    Node node{};
+    if (!ProbeNode(self, node)) return _ZN3sce4Json5Value11s_nullarrayE;
+    if (node.type == TypeArray) return node.array;
+    bool usedDefault = false;
+    const auto& value = TypedProbed(self, node, TypeArray, &usedDefault);
+    if (usedDefault) return _ZN3sce4Json5Value11s_nullarrayE;
+    Node valueNode{};
+    if (ProbeNode(&value, valueNode) && valueNode.type == TypeArray) return valueNode.array;
+    return _ZN3sce4Json5Value11s_nullarrayE;
+}
+const Object* APS5_VABI _ZNK3sce4Json5Value9getObjectEv(const Value* self) {
+    Node node{};
+    if (!ProbeNode(self, node)) return _ZN3sce4Json5Value12s_nullobjectE;
+    if (node.type == TypeObject) return node.object;
+    bool usedDefault = false;
+    const auto& value = TypedProbed(self, node, TypeObject, &usedDefault);
+    if (usedDefault) return _ZN3sce4Json5Value12s_nullobjectE;
+    Node valueNode{};
+    if (ProbeNode(&value, valueNode) && valueNode.type == TypeObject) return valueNode.object;
+    return _ZN3sce4Json5Value12s_nullobjectE;
+}
 std::size_t APS5_VABI _ZNK3sce4Json5Value5countEv(const Value* self) {
-    const Node& n = NodeOf(*self);
-    if (n.type == TypeArray) return n.array->items->size();
-    if (n.type == TypeObject) return n.object->items->size();
+    Node node{};
+    if (!ProbeNode(self, node)) return 0;
+    if (node.type == TypeArray) return node.array && ProbePayloadObject(node.array) ? node.array->items->size() : 0;
+    if (node.type == TypeObject) return node.object && ProbePayloadObject(node.object) ? node.object->items->size() : 0;
     return 0;
 }
-const Value* APS5_VABI _ZNK3sce4Json5ValueixERKNS0_6StringE(const Value* self, const String* key) { return LookupKey(self, key); }
+const Value* APS5_VABI _ZNK3sce4Json5ValueixERKNS0_6StringE(const Value* self, const String* key) {
+    Node node{};
+    if (!ProbeNode(self, node)) return nullptr;
+    return LookupKeyProbed(self, node, key);
+}
 const Value* APS5_VABI _ZNK3sce4Json5ValueixEPKc(const Value* self, const char* key) {
-    ScopedString text(key ? key : "");
-    return LookupKey(self, &text.string);
+    Node node{};
+    if (!ProbeNode(self, node)) return nullptr;
+    if (!key) {
+        ScopedString text("");
+        return LookupKeyProbed(self, node, &text.string);
+    }
+    std::string bytes;
+    if (!ProbeZString(bytes, key)) {
+        ScopedString text("");
+        return LookupKeyProbed(self, node, &text.string);
+    }
+    ScopedString text(bytes);
+    return LookupKeyProbed(self, node, &text.string);
 }
 const Value* APS5_VABI _ZNK3sce4Json5ValueixEm(const Value* self, std::size_t index) {
-    if (self->type == TypeArray && index < self->array->items->size()) {
-        auto it = self->array->items->begin();
+    Node node{};
+    if (!ProbeNode(self, node)) return &MissingElementProbed(self, node, static_cast<int>(0x80848118), nullptr, &index);
+    if (node.type == TypeArray && node.array && ProbePayloadObject(node.array) && index < node.array->items->size()) {
+        auto it = node.array->items->begin();
         std::advance(it, static_cast<std::ptrdiff_t>(index));
         return &*it;
     }
-    if (self->type == TypeObject && index < self->object->items->size()) {
-        auto it = self->object->items->begin();
+    if (node.type == TypeObject && node.object && ProbePayloadObject(node.object) && index < node.object->items->size()) {
+        auto it = node.object->items->begin();
         std::advance(it, static_cast<std::ptrdiff_t>(index));
         return &it->value;
     }
-    const auto error = self->type == TypeArray || self->type == TypeObject ? 0x80848116 : 0x80848118;
-    return &MissingElement(self, static_cast<int>(error), nullptr, &index);
+    const auto error = node.type == TypeArray || node.type == TypeObject ? 0x80848116 : 0x80848118;
+    return &MissingElementProbed(self, node, static_cast<int>(error), nullptr, &index);
 }
 void APS5_VABI _ZN3sce4Json5ValueC1ENS0_9ValueTypeE(Value* self, ValueType type) {
-    Construct(*self);
-    SetType(*self, type);
+    Node node{};
+    if (!ProbeNode(self, node)) return;
+    Construct(node);
+    SetTypeProbed(node, type, self);
+    WriteNode(self, node);
+    RebindProbed(self, node);
 }
 const Value* APS5_VABI _ZNK3sce4Json5Value8getValueEm(const Value* self, std::size_t index) { return _ZNK3sce4Json5ValueixEm(self, index); }
-const Value* APS5_VABI _ZNK3sce4Json5Value8getValueERKNS0_6StringE(const Value* self, const String* key) { return LookupKey(self, key); }
+const Value* APS5_VABI _ZNK3sce4Json5Value8getValueERKNS0_6StringE(const Value* self, const String* key) {
+    Node node{};
+    if (!ProbeNode(self, node)) return nullptr;
+    return LookupKeyProbed(self, node, key);
+}
 Value* APS5_VABI _ZN3sce4Json5Value10referValueEm(Value* self, std::size_t index) {
-    if (self->type == TypeArray && index < self->array->items->size()) {
-        auto it = self->array->items->begin();
+    Node node{};
+    if (!ProbeNode(self, node)) return nullptr;
+    if (node.type == TypeArray && node.array && ProbePayloadObject(node.array) && index < node.array->items->size()) {
+        auto it = node.array->items->begin();
         std::advance(it, static_cast<std::ptrdiff_t>(index));
         return &*it;
     }
-    if (self->type == TypeObject && index < self->object->items->size()) {
-        auto it = self->object->items->begin();
+    if (node.type == TypeObject && node.object && ProbePayloadObject(node.object) && index < node.object->items->size()) {
+        auto it = node.object->items->begin();
         std::advance(it, static_cast<std::ptrdiff_t>(index));
         return &it->value;
     }
     return nullptr;
 }
 Value* APS5_VABI _ZN3sce4Json5Value10referValueERKNS0_6StringE(Value* self, const String* key) {
-    Node& n = NodeOf(*self);
-    if (key == nullptr || n.type != TypeObject) return nullptr;
-    if (!n.object->items) return nullptr;
-    auto* node = n.object->items->Find(Characters(*key));
-    return node && !node->nil ? &node->pair.value : nullptr;
+    Node node{};
+    if (!ProbeNode(self, node)) return nullptr;
+    if (key == nullptr || node.type != TypeObject) return nullptr;
+    if (!node.object || !ProbePayloadObject(node.object)) return nullptr;
+    if (!node.object->items) return nullptr;
+    const auto keyHeader = ProbeStringHeader(key);
+    if (!keyHeader) return nullptr;
+    auto* found = node.object->items->Find(ZCharactersOrEmpty(*keyHeader).data());
+    return found && !found->nil ? &found->pair.value : nullptr;
 }
 Array* APS5_VABI _ZN3sce4Json5Value10referArrayEv(Value* self) {
-    Node& n = NodeOf(*self);
-    if (n.type == TypeNull) SetType(n, TypeArray);
-    if (n.type != TypeArray) throw std::runtime_error("sce::Json::Value::referArray: value is not an array");
-    return n.array;
+    Node node{};
+    if (!ProbeNode(self, node)) throw std::runtime_error("sce::Json::Value::referArray: value is not an array");
+    if (node.type == TypeNull) {
+        SetTypeProbed(node, TypeArray, self);
+        WriteNode(self, node);
+        RebindProbed(self, node);
+    }
+    if (node.type != TypeArray) throw std::runtime_error("sce::Json::Value::referArray: value is not an array");
+    return node.array;
 }
 Object* APS5_VABI _ZN3sce4Json5Value11referObjectEv(Value* self) {
-    Node& n = NodeOf(*self);
-    if (n.type == TypeNull) SetType(n, TypeObject);
-    if (n.type != TypeObject) throw std::runtime_error("sce::Json::Value::referObject: value is not an object");
-    return n.object;
+    Node node{};
+    if (!ProbeNode(self, node)) throw std::runtime_error("sce::Json::Value::referObject: value is not an object");
+    if (node.type == TypeNull) {
+        SetTypeProbed(node, TypeObject, self);
+        WriteNode(self, node);
+        RebindProbed(self, node);
+    }
+    if (node.type != TypeObject) throw std::runtime_error("sce::Json::Value::referObject: value is not an object");
+    return node.object;
 }
 int APS5_VABI _ZN3sce4Json5Value9serializeEPFiRNS0_6StringEPvES4_(Value* self, SerializationCallback callback, void* context) {
     return SerializeCallbackValue(self, nullptr, callback, context, false);
@@ -3626,18 +4377,26 @@ int APS5_VABI _ZN3sce4Json5Value9serializeERNS0_6StringE(Value* self, String* ou
     return SerializeCallbackValue(self, out, SerializationSucceeded, nullptr, true);
 }
 void APS5_VABI _ZNK3sce4Json5Value8toStringERNS0_6StringE(const Value* self, String* out) {
+    Node node{};
+    if (!ProbeNode(self, node)) return;
     std::string text;
-    if (self->type == TypeString) AppendText(*out, Characters(*self->string));
-    else {
-        if (self->type == TypeArray) text = "array";
-        else if (self->type == TypeObject) text = "object";
-        else if (self->type == TypeReal) {
-            if (!FloatConfiguration().enabled) { AppendLegacyReal(*out, self->real); return; }
-            AppendReal(text, self->real);
+    if (node.type == TypeString) {
+        String handle{};
+        if (node.string && ProbePayloadString(node.string, handle)) {
+            if (const auto header = ProbeStringHeader(&handle)) {
+                if (const auto characters = ProbeZCharacters(*header)) AppendProbed(out, *characters);
+            }
         }
-        else Serialize(text, *self);
-        AppendText(*out, text);
+        return;
     }
+    if (node.type == TypeArray) text = "array";
+    else if (node.type == TypeObject) text = "object";
+    else if (node.type == TypeReal) {
+        if (!FloatConfiguration().enabled) { AppendProbed(out, LegacyRealText(node.real)); return; }
+        AppendReal(text, node.real);
+    }
+    else Serialize(text, *self);
+    AppendProbed(out, text);
 }
 
 int APS5_VABI _ZN3sce4Json6Parser5parseERNS0_5ValueEPFiRcPvES5_(Value* out, ParserReadCallback read, void* context) {
@@ -3739,8 +4498,10 @@ int APS5_VABI _ZN3sce4Json11Initializer10initializeEPKNS0_14InitParameter2E(void
 }
 
 void APS5_VABI _ZN3sce4Json5Value5clearEv(Value* self) {
-    if (self == nullptr) return;
-    Clear(NodeOf(*self));
+    Node node{};
+    if (!ProbeNode(self, node)) return;
+    ClearProbed(node);
+    WriteNode(self, node);
 }
 
 void APS5_VABI _ZN3sce4Json12MemAllocator11notifyErrorEimPv(void* self, int error, std::size_t size, void* userData) {
@@ -3751,49 +4512,71 @@ void APS5_VABI _ZN3sce4Json12MemAllocator11notifyErrorEimPv(void* self, int erro
 }
 
 int APS5_VABI _ZN3sce4Json5Value21setNullAccessCallBackEPFRKS1_NS0_9ValueTypeEPS2_PvES6_(Value* self, NullAccessCallback callback, void* context) {
-    if (self->parent) return static_cast<int>(0x80848104);
+    Node node{};
+    if (!ProbeNode(self, node)) return static_cast<int>(0x80848104);
+    if (node.parent) return static_cast<int>(0x80848104);
     {
         auto& state = State();
         std::lock_guard lock(state.mutex);
         if (ModernValues() && !state.allocation) return JsonErrorNotInitialized;
     }
-    if (!ModernValues() && !self->auxiliary) return static_cast<int>(0x80848104);
-    const auto status = EnsureAuxiliary(*self);
+    if (!ModernValues() && !node.auxiliary) return static_cast<int>(0x80848104);
+    const auto status = EnsureAuxiliary(node);
+    WriteNode(self, node);
+    if (node.auxiliary && node.auxiliary->fallback) node.auxiliary->fallback->parent = self;
     if (status) return status;
-    self->auxiliary->nullAccess = callback;
-    self->auxiliary->nullAccessContext = context;
+    node.auxiliary->nullAccess = callback;
+    node.auxiliary->nullAccessContext = context;
+    if (node.auxiliary->fallback) node.auxiliary->fallback->parent = self;
     return 0;
 }
 
 int APS5_VABI _ZN3sce4Json5Value30setElementAccessFailureHandlerEPFviPKNS0_6StringEPKmPKS1_S8_PvES9_(Value* self, ElementAccessFailureHandler handler, void* context) {
-    return SetHandler(*self, &Auxiliary::elementAccessFailure, handler, context);
+    Node node{};
+    if (!ProbeNode(self, node)) return static_cast<int>(0x80848104);
+    return SetHandlerProbed(self, node, &Auxiliary::elementAccessFailure, handler, context);
 }
 
 int APS5_VABI _ZN3sce4Json5Value22setSpecialFloatHandlerEPFKS1_NS0_12FunctionTypeEdPS2_PvPbES5_(Value* self, SpecialFloatHandler handler, void* context) {
-    return SetHandler(*self, &Auxiliary::specialFloat, handler, context, true);
+    Node node{};
+    if (!ProbeNode(self, node)) return static_cast<int>(0x80848104);
+    return SetHandlerProbed(self, node, &Auxiliary::specialFloat, handler, context, true);
 }
 
 int APS5_VABI _ZN3sce4Json5Value22setTypeMismatchHandlerEPFRKS1_NS0_9ValueTypeEPS2_S5_PvES6_(Value* self, TypeMismatchHandler handler, void* context) {
-    return SetHandler(*self, &Auxiliary::typeMismatch, handler, context);
+    Node node{};
+    if (!ProbeNode(self, node)) return static_cast<int>(0x80848104);
+    return SetHandlerProbed(self, node, &Auxiliary::typeMismatch, handler, context);
 }
 
 bool APS5_VABI _ZNK3sce4Json5ValuecvbEv(const Value* self) {
-    const Node& n = NodeOf(*self);
-    if (n.type != TypeBoolean) {
+    Node node{};
+    if (!ProbeNode(self, node)) return false;
+    if (node.type != TypeBoolean) {
         CallbackScope scope;
-        const auto handlers = HandlersOf(n);
+        const auto handlers = HandlersOfProbed(self);
         if (scope.entered && handlers.typeMismatch) {
-            const Value& replacement = handlers.typeMismatch(TypeBoolean, self, self->parent, handlers.typeMismatchContext);
-            return Typed(&replacement, TypeBoolean).boolean;
+            const Value& replacement = handlers.typeMismatch(TypeBoolean, self, node.parent, handlers.typeMismatchContext);
+            Node replacementNode{};
+            if (!ProbeNode(&replacement, replacementNode)) return false;
+            const Value& typed = TypedProbed(&replacement, replacementNode, TypeBoolean);
+            Node typedNode{};
+            if (!ProbeNode(&typed, typedNode)) return false;
+            return typedNode.boolean;
         }
     }
-    switch (n.type) {
+    switch (node.type) {
         case TypeNull: return false;
-        case TypeBoolean: return n.boolean;
-        case TypeInteger: return n.integer != 0;
-        case TypeUInteger: return n.uinteger != 0;
-        case TypeReal: return n.real != 0.0;
-        case TypeString: return !View(*n.string).empty();
+        case TypeBoolean: return node.boolean;
+        case TypeInteger: return node.integer != 0;
+        case TypeUInteger: return node.uinteger != 0;
+        case TypeReal: return node.real != 0.0;
+        case TypeString: {
+            String handle{};
+            if (!node.string || !ProbePayloadString(node.string, handle)) return false;
+            const auto header = ProbeStringHeader(&handle);
+            return header && header->length != 0;
+        }
         case TypeArray:
         case TypeObject: return true;
         default: throw std::runtime_error("sce::Json::Value: invalid value type");
@@ -3929,11 +4712,35 @@ void APS5_VABI _ZN3sce4Json6StringC2ERKS1_(String* self, const String* other) { 
 void APS5_VABI _ZN3sce4Json6StringC2Ev(String* self) { _ZN3sce4Json6StringC1Ev(self); }
 void APS5_VABI _ZN3sce4Json6StringD2Ev(String* self) { _ZN3sce4Json6StringD1Ev(self); }
 
-String* APS5_VABI _ZN3sce4Json5Value11referStringEv(Value* self) { return self->type == TypeString ? self->string : nullptr; }
-bool* APS5_VABI _ZN3sce4Json5Value12referBooleanEv(Value* self) { return self->type == TypeBoolean ? &self->boolean : nullptr; }
-std::int64_t* APS5_VABI _ZN3sce4Json5Value12referIntegerEv(Value* self) { return self->type == TypeInteger || self->type == TypeUInteger ? &self->integer : nullptr; }
-std::uint64_t* APS5_VABI _ZN3sce4Json5Value13referUIntegerEv(Value* self) { return self->type == TypeInteger || self->type == TypeUInteger ? &self->uinteger : nullptr; }
-double* APS5_VABI _ZN3sce4Json5Value9referRealEv(Value* self) { return self->type == TypeReal ? &self->real : nullptr; }
+String* APS5_VABI _ZN3sce4Json5Value11referStringEv(Value* self) {
+    Node node{};
+    if (!ProbeNode(self, node) || node.type != TypeString) return nullptr;
+    return node.string;
+}
+bool* APS5_VABI _ZN3sce4Json5Value12referBooleanEv(Value* self) {
+    Node node{};
+    if (!ProbeNode(self, node) || node.type != TypeBoolean) return nullptr;
+    return reinterpret_cast<bool*>(reinterpret_cast<std::byte*>(self) + offsetof(Value, payload));
+}
+std::int64_t* APS5_VABI _ZN3sce4Json5Value12referIntegerEv(Value* self) {
+    Node node{};
+    if (!ProbeNode(self, node) || (node.type != TypeInteger && node.type != TypeUInteger)) return nullptr;
+    return reinterpret_cast<std::int64_t*>(reinterpret_cast<std::byte*>(self) + offsetof(Value, payload));
+}
+std::uint64_t* APS5_VABI _ZN3sce4Json5Value13referUIntegerEv(Value* self) {
+    Node node{};
+    if (!ProbeNode(self, node) || (node.type != TypeInteger && node.type != TypeUInteger)) return nullptr;
+    return reinterpret_cast<std::uint64_t*>(reinterpret_cast<std::byte*>(self) + offsetof(Value, payload));
+}
+double* APS5_VABI _ZN3sce4Json5Value9referRealEv(Value* self) {
+    Node node{};
+    if (!ProbeNode(self, node) || node.type != TypeReal) return nullptr;
+    return reinterpret_cast<double*>(reinterpret_cast<std::byte*>(self) + offsetof(Value, payload));
+}
+void* APS5_VABI _ZNK3sce4Json14InitParameter211getUserDataEv(const InitParameter2* self) { return self->userData; }
+void* APS5_VABI _ZNK3sce4Json14InitParameter212getAllocatorEv(const InitParameter2* self) { return self->allocator; }
+std::size_t APS5_VABI _ZNK3sce4Json14InitParameter217getFileBufferSizeEv(const InitParameter2* self) { return self->fileBufferSize; }
+std::int32_t APS5_VABI _ZNK3sce4Json14InitParameter225getSpecialFloatFormatTypeEv(const InitParameter2* self) { return self->specialFloatFormatType; }
 void* APS5_VABI _ZNK3sce4Json14InitParameter211getUserDataEv(const InitParameter2* self) { return LoadGuest<InitParameter2>(self, __func__).userData; }
 void* APS5_VABI _ZNK3sce4Json14InitParameter212getAllocatorEv(const InitParameter2* self) { return LoadGuest<InitParameter2>(self, __func__).allocator; }
 std::size_t APS5_VABI _ZNK3sce4Json14InitParameter217getFileBufferSizeEv(const InitParameter2* self) { return LoadGuest<InitParameter2>(self, __func__).fileBufferSize; }
