@@ -104,6 +104,45 @@ void RequireClosedHandle() {
     for (std::uint8_t byte : destination) Require(byte == 0);
 }
 
+void RequireForgedHandle() {
+    // A handle Open never published must refuse without dereferencing: an
+    // unmapped address would fault the host and a writable one would corrupt
+    // it. Every queue command shares the slot-table resolution.
+    std::uint8_t bytes[16]{};
+    void* forged = bytes;
+    Require(sceSdmaBeginQueueMode(forged) == InvalidArgument);
+    Require(sceSdmaCancelQueue(forged) == InvalidArgument);
+    Require(sceSdmaClose(forged) == InvalidArgument);
+    Require(sceSdmaConstantFill(forged, 0, Address(bytes), 16, 0) == InvalidArgument);
+    Require(sceSdmaConstantFillNonBlocking(forged, 0, Address(bytes), 16, 0) == InvalidArgument);
+    Require(sceSdmaCopyLinear(forged, Address(bytes), Address(bytes), 8) == InvalidArgument);
+    Require(sceSdmaCopyLinearNonBlocking(forged, Address(bytes), Address(bytes), 8) == InvalidArgument);
+    Require(sceSdmaCopyWindowL2L(forged, Address(bytes), Address(bytes), 8, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0) == InvalidArgument);
+    Require(sceSdmaEndQueueMode(forged) == InvalidArgument);
+    Require(sceSdmaFenceNonBlocking(forged) == InvalidArgument);
+    Require(sceSdmaFlushAll(forged) == InvalidArgument);
+    Require(sceSdmaKickQueue(forged) == InvalidArgument);
+    Require(sceSdmaTryFlush(forged) == InvalidArgument);
+    for (std::uint8_t byte : bytes) Require(byte == 0);
+    auto* unmapped = reinterpret_cast<void*>(0x10);
+    Require(sceSdmaBeginQueueMode(unmapped) == InvalidArgument);
+    Require(sceSdmaClose(unmapped) == InvalidArgument);
+    Require(sceSdmaKickQueue(unmapped) == InvalidArgument);
+    errno = 71;
+    Engine engine(14, 0x8000);
+    // The just-closed slot address keeps resolving so double close stays 0
+    // and the copy commands keep refusing on the closed slot.
+    Require(sceSdmaClose(engine.handle) == 0);
+    Require(sceSdmaCopyLinear(engine.handle, Address(bytes), Address(bytes), 8) == InvalidArgument);
+    errno = 71;
+    // A slot re-opened at the same address works again.
+    SdmaOpenParam param{14, 0, 0, 0, 0, 0};
+    Require(sceSdmaOpen(&engine.handle, engine.buffer.data(), 0x8000, &param) == 0);
+    Require(sceSdmaKickQueue(engine.handle) == 0);
+    Require(sceSdmaClose(engine.handle) == 0);
+    Require(errno == 71);
+}
+
 void RequireLinear() {
     Engine engine(13, 0x8000);
     const auto source = Pattern(0x400000 + 0x1234, 7);
@@ -247,6 +286,7 @@ int main() {
     RequireOpen();
     RequireNullHandle();
     RequireClosedHandle();
+    RequireForgedHandle();
     RequireLinear();
     RequireFill();
     RequireWindow();
