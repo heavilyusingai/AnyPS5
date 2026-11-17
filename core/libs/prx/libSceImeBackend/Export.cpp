@@ -40,20 +40,51 @@ struct State {
 std::mutex g_mutex;
 std::unique_ptr<State> g_state;
 
-void CopyText(const std::u16string& source, char16_t* output, std::size_t capacity) {
+bool CopyText(const std::u16string& source, char16_t* output, std::size_t capacity) {
     const std::size_t count = std::min(source.size(), capacity);
-    if (count != 0) std::memcpy(output, source.data(), count * sizeof(char16_t));
-    output[count] = 0;
+    const int savedErrno = errno;
+    if (count != 0 && !GuestCopyOut_nid_no_patch(output, source.data(), count * sizeof(char16_t))) {
+        errno = savedErrno;
+        return false;
+    }
+    const char16_t terminator = 0;
+    const bool written = GuestCopyOut_nid_no_patch(output + count, &terminator, sizeof(terminator));
+    errno = savedErrno;
+    return written;
 }
 
-int ValidateParam(const SceImeBackendParam& param) {
+bool ProbeParam(const SceImeBackendParam* param, SceImeBackendParam& local) {
+    if (param == nullptr) return false;
+    const int savedErrno = errno;
+    const bool read = GuestCopyIn_nid_no_patch(&local, param, sizeof(SceImeBackendParam));
+    errno = savedErrno;
+    return read;
+}
+
+// Reads the guest UTF-16 initial string the way the raw length scan sees it:
+// a terminator within the limit admits the text, a longer run reports
+// too-long, an unreadable buffer refuses so Open never faults.
+int ReadInitialString(const char16_t* source, std::u16string& destination) {
+    char16_t chunk[0x40];
+    destination.clear();
+    for (std::size_t offset = 0; offset <= kInitialStringLimit; offset += std::size(chunk)) {
+        const std::size_t units = std::min<std::size_t>(std::size(chunk), kInitialStringLimit + 1 - offset);
+        const int savedErrno = errno;
+        const bool read = GuestCopyIn_nid_no_patch(chunk, source + offset, units * sizeof(char16_t));
+        errno = savedErrno;
+        if (!read) return kNullArgument;
+        const char16_t* end = std::find(chunk, chunk + units, char16_t{0});
+        destination.append(chunk, end - chunk);
+        if (end != chunk + units) return 0;
+    }
+    return kInitialStringTooLong;
+}
+
+int ValidateParam(const SceImeBackendParam& param, bool initialStringTooLong) {
     if (param.mode == -1 || param.mode == 0xff) return kInvalidMode;
     if (param.maxLength < 1 || param.maxLength > 0x1b) return kInvalidLength;
     if (param.type < 0 || param.type > 3) return kInvalidType;
-    if ((param.type & 2) != 0 && param.initialString != nullptr &&
-        std::char_traits<char16_t>::length(param.initialString) > kInitialStringLimit) {
-        return kInitialStringTooLong;
-    }
+    if (initialStringTooLong) return kInitialStringTooLong;
     if (param.field18 < 0 || param.field18 > 1) return kInvalidField18;
     for (const std::uint8_t value : param.reserved) {
         if (value != 0) return kInvalidReservedField;
@@ -83,14 +114,23 @@ int APS5_VABI sceImeBackendOpen(const SceImeBackendParam* param, void* reserved)
     if (g_state != nullptr) return kAlreadyInitialized;
     if (param == nullptr) return kNullArgument;
     if (reserved != nullptr) return kInvalidReservedArgument;
-    const int result = ValidateParam(*param);
-    if (result != 0) return result;
-    auto state = std::make_unique<State>();
-    state->maxLength = param->maxLength;
-    state->type = param->type;
-    if ((param->type & 2) != 0 && param->initialString != nullptr) {
-        state->text.assign(param->initialString);
+    SceImeBackendParam local{};
+    if (!ProbeParam(param, local)) return kNullArgument;
+    std::u16string initialText;
+    bool initialStringTooLong = false;
+    bool initialStringUnreadable = false;
+    if ((local.type & 2) != 0 && local.initialString != nullptr) {
+        const int status = ReadInitialString(local.initialString, initialText);
+        if (status == kInitialStringTooLong) initialStringTooLong = true;
+        else if (status != 0) initialStringUnreadable = true;
     }
+    const int result = ValidateParam(local, initialStringTooLong);
+    if (result != 0) return result;
+    if (initialStringUnreadable) return kNullArgument;
+    auto state = std::make_unique<State>();
+    state->maxLength = local.maxLength;
+    state->type = local.type;
+    state->text = std::move(initialText);
     state->caret = state->text.size();
     g_state = std::move(state);
     return 0;
@@ -135,7 +175,7 @@ int APS5_VABI sceImeBackendEnterCharacter(std::uint32_t character, char16_t* out
     state->text.insert(state->text.begin() + static_cast<std::ptrdiff_t>(state->caret),
                        static_cast<char16_t>(character));
     ++state->caret;
-    CopyText(state->text, output, kTextCapacity);
+    if (!CopyText(state->text, output, kTextCapacity)) return kNullArgument;
     return 0;
 }
 
@@ -193,7 +233,7 @@ int APS5_VABI sceImeBackendGetString(int which, char16_t* output, std::uint16_t 
     if (state == nullptr) return kNotInitialized;
     if (output == nullptr) return kNullArgument;
     if (which != 0 && which != 1) return kInvalidStringSelector;
-    CopyText(state->text, output, capacity);
+    if (!CopyText(state->text, output, capacity)) return kNullArgument;
     return 0;
 }
 
@@ -202,7 +242,7 @@ int APS5_VABI sceImeBackendGetConvertString(char16_t* output) {
     State* state = CurrentState();
     if (state == nullptr) return kNotInitialized;
     if (output == nullptr) return kNullArgument;
-    CopyText(state->text, output, kTextCapacity);
+    if (!CopyText(state->text, output, kTextCapacity)) return kNullArgument;
     return 0;
 }
 
@@ -211,7 +251,7 @@ int APS5_VABI sceImeBackendGetConfirmString(char16_t* output) {
     State* state = CurrentState();
     if (state == nullptr) return kNotInitialized;
     if (output == nullptr) return kNullArgument;
-    CopyText(state->text, output, kTextCapacity);
+    if (!CopyText(state->text, output, kTextCapacity)) return kNullArgument;
     return 0;
 }
 
@@ -247,8 +287,16 @@ int APS5_VABI sceImeBackendGetCandidateList(std::uint16_t* selected, char16_t* o
     if (state == nullptr) return kNotInitialized;
     if (selected == nullptr || output == nullptr) return kNullArgument;
     if (state->status >= 2) return kNotAvailable;
-    *selected = 0;
-    output[0] = 0;
+    const std::uint16_t none = 0;
+    const char16_t terminator = 0;
+    const int savedErrno = errno;
+    if (!GuestCopyOut_nid_no_patch(selected, &none, sizeof(none))) {
+        errno = savedErrno;
+        return kNullArgument;
+    }
+    const bool written = GuestCopyOut_nid_no_patch(output, &terminator, sizeof(terminator));
+    errno = savedErrno;
+    if (!written) return kNullArgument;
     return 0;
 }
 
@@ -266,7 +314,11 @@ int APS5_VABI sceImeBackendGetCandidateSelect(std::uint16_t* selected) {
     if (state == nullptr) return kNotInitialized;
     if (selected == nullptr) return kNullArgument;
     if (state->status >= 2) return kNotAvailable;
-    *selected = 0;
+    const std::uint16_t none = 0;
+    const int savedErrno = errno;
+    const bool written = GuestCopyOut_nid_no_patch(selected, &none, sizeof(none));
+    errno = savedErrno;
+    if (!written) return kNullArgument;
     return 0;
 }
 
@@ -275,7 +327,10 @@ int APS5_VABI sceImeBackendGetConvertMode(int* mode) {
     State* state = CurrentState();
     if (state == nullptr) return kNotInitialized;
     if (mode == nullptr) return kNullArgument;
-    *mode = state->convertMode;
+    const int savedErrno = errno;
+    const bool written = GuestCopyOut_nid_no_patch(mode, &state->convertMode, sizeof(state->convertMode));
+    errno = savedErrno;
+    if (!written) return kNullArgument;
     return 0;
 }
 
