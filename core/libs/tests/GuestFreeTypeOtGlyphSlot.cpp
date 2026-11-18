@@ -1,9 +1,11 @@
 #include "prx/libSceFreeTypeOt/include/Bitmap.hpp"
 #include "prx/libSceFreeTypeOt/include/GlyphSlot.hpp"
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 
 namespace {
 
@@ -76,6 +78,16 @@ void Require(bool condition, const char* message) {
     if (condition) return;
     std::fprintf(stderr, "FreeType Ot glyph slot: %s\n", message);
     std::exit(1);
+}
+
+template <typename TCall>
+bool Throws(TCall call) {
+    try {
+        call();
+    } catch (const std::exception&) {
+        return true;
+    }
+    return false;
 }
 
 bool Zeroed(const unsigned char* bytes, std::size_t size) {
@@ -342,6 +354,36 @@ void NewSlotFailures() {
 
 }
 
+void ProbeRefusals() {
+    {
+        Fixture fixture;
+        errno = 71;
+        Require(sceFreeTypeOtGlyphSlotOwnBitmap_nid_no_patch(reinterpret_cast<GuestGlyphSlotRec*>(0x10)) == 0, "OwnBitmap ignores an unreadable slot like a null one");
+        Require(errno == 71, "an unreadable slot keeps the caller errno in OwnBitmap");
+    }
+    {
+        Fixture fixture;
+        fixture.slot.format = FreeType::GlyphFormatBitmap;
+        errno = 71;
+        Require(Throws([&] { ft_glyphslot_set_bitmap_nid_postfix(reinterpret_cast<GuestGlyphSlotRec*>(0x10), nullptr); }), "set_bitmap refuses an unreadable slot");
+        Require(errno == 71, "an unreadable slot keeps the caller errno in set_bitmap");
+    }
+    {
+        Fixture fixture;
+        errno = 71;
+        Require(Throws([&] { ft_glyphslot_alloc_bitmap_nid_postfix(reinterpret_cast<GuestGlyphSlotRec*>(0x10), 12); }), "alloc_bitmap refuses an unreadable slot");
+        Require(errno == 71, "an unreadable slot keeps the caller errno in alloc_bitmap");
+    }
+    {
+        Fixture fixture;
+        GuestGlyphSlotRec* slot = nullptr;
+        errno = 71;
+        Require(FT_New_GlyphSlot_nid_postfix(reinterpret_cast<GuestFaceRec*>(0x10), &slot) == 0x06, "New_GlyphSlot refuses an unreadable face with Invalid_Argument");
+        Require(errno == 71, "an unreadable face keeps the caller errno");
+        Require(slot == nullptr, "New_GlyphSlot leaves the output untouched for an unreadable face");
+    }
+}
+
 int main() {
     Allocation();
     AllocationErrors();
@@ -354,6 +396,7 @@ int main() {
     NewSlotWithoutOutlines();
     NewSlotArguments();
     NewSlotFailures();
+    ProbeRefusals();
     std::puts("Guest FreeType Ot glyph slot tests passed");
     return 0;
 }
