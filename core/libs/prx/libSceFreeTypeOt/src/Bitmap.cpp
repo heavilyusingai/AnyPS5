@@ -9,6 +9,7 @@
 #include "prx/libSceFreeTypeOt/include/Memory.hpp"
 #include "prx/libc/include/General.hpp"
 
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -45,19 +46,45 @@ std::int32_t CopyBitmap(GuestBitmapLibrary* library, const GuestBitmap* source, 
 
 }
 
+namespace {
+constexpr int InvalidArgument = 0x06;
+}
+
 extern "C" {
 
 int APS5_VABI sceFreeTypeOtGlyphSlotOwnBitmap_nid_no_patch(GuestGlyphSlotRec* slot) {
     const char* function = __func__;
-    if (!slot || slot->format != GlyphFormatBitmap) return 0;
-    auto* internal = static_cast<GuestSlotInternalRec*>(slot->internal);
-    if (!internal) NotImplemented_nid_no_patch(function);
-    if (internal->flags & GlyphOwnBitmap) return 0;
+    GuestGlyphSlotRec local{};
+    if (!slot) return 0;
+    {
+        const int savedErrno = errno;
+        const bool readable = GuestCopyIn_nid_no_patch(&local, slot, sizeof(local));
+        errno = savedErrno;
+        if (!readable || local.format != GlyphFormatBitmap) return 0;
+    }
+    GuestSlotInternalRec internal{};
+    if (!local.internal) NotImplemented_nid_no_patch(function);
+    {
+        const int savedErrno = errno;
+        const bool readable = GuestCopyIn_nid_no_patch(&internal, static_cast<GuestSlotInternalRec*>(local.internal), sizeof(internal));
+        errno = savedErrno;
+        if (!readable) NotImplemented_nid_no_patch(function);
+    }
+    if (internal.flags & GlyphOwnBitmap) return 0;
     GuestBitmap bitmap{};
-    const std::int32_t error = CopyBitmap(static_cast<GuestBitmapLibrary*>(slot->library), &slot->bitmap, &bitmap, function);
+    const std::int32_t error = CopyBitmap(static_cast<GuestBitmapLibrary*>(local.library), &local.bitmap, &bitmap, function);
     if (error) return error;
-    slot->bitmap = bitmap;
-    internal->flags |= GlyphOwnBitmap;
+    {
+        const int savedWriteErrno = errno;
+        const bool published = GuestCopyOut_nid_no_patch(&slot->bitmap, &bitmap, sizeof(bitmap));
+        errno = savedWriteErrno;
+        if (!published) return InvalidArgument;
+        internal.flags |= GlyphOwnBitmap;
+        const int savedFlagsErrno = errno;
+        const bool flagsWritten = GuestCopyOut_nid_no_patch(static_cast<GuestSlotInternalRec*>(local.internal), &internal, sizeof(internal));
+        errno = savedFlagsErrno;
+        if (!flagsWritten) return InvalidArgument;
+    }
     return 0;
 }
 APS5_EXPORT("nSIux4OQyJM", sceFreeTypeOtGlyphSlotOwnBitmap_nid_no_patch);

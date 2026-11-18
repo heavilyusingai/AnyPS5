@@ -1,6 +1,7 @@
 #include "prx/libSceFreeTypeOt/libSceFreeTypeOt.hpp"
 #include "prx/libSceFreeType/include/GuestObjects.hpp"
 #include <cerrno>
+#include <array>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -11,6 +12,32 @@
 #include "prx/libSceFreeTypeOt/libSceFreeTypeOt.hpp"
 
 namespace {
+
+// Copies a guest NUL-terminated string into a fixed buffer. Refuses
+// strings that do not terminate within the capacity, mirroring the
+// bounded-copy convention.
+bool CopyGuestZString(char* destination, const char* source, std::size_t capacity) {
+    for (std::size_t index = 0; index < capacity; ++index) {
+        char unit = 0;
+        const int savedErrno = errno;
+        const bool copied = GuestCopyIn_nid_no_patch(&unit, source + index, sizeof(unit));
+        errno = savedErrno;
+        if (!copied) return false;
+        destination[index] = unit;
+        if (!unit) return true;
+    }
+    return false;
+}
+
+// Ownership scan for the probed library handle. The handle was already
+// fault-guard probed at the export boundary; this walks the host-side face
+// list looking for the slot mirror the guest passed.
+bool SlotOwnedByLibrary(FreeType::GuestLibrary* library, FreeType::GuestGlyphSlotRec* slot) {
+    for (const auto& face : library->faces) {
+        if (&face->slot == slot) return true;
+    }
+    return false;
+}
 
 std::uint64_t Magnitude(std::int64_t value) {
     return value < 0 ? 0 - static_cast<std::uint64_t>(value) : static_cast<std::uint64_t>(value);
@@ -176,10 +203,27 @@ int APS5_VABI sceFreeTypeOtUnknown_qAPXM5DN62Q_nid_no_patch() {
 APS5_EXPORT("qAPXM5DN62Q", sceFreeTypeOtUnknown_qAPXM5DN62Q_nid_no_patch);
 
 int APS5_VABI FT_Render_Glyph_Internal_nid_postfix(FreeType::GuestLibrary* library, FreeType::GuestGlyphSlotRec* slot, std::int32_t renderMode) {
-    if (!library || !slot || !slot->face || slot->library != library) NotImplemented_nid_no_patch(__func__);
-    bool owned = false;
-    for (const auto& face : library->faces) owned = owned || &face->slot == slot;
-    if (!owned) NotImplemented_nid_no_patch(__func__);
+    const char* function = __func__;
+    FreeType::GuestGlyphSlotRec local{};
+    if (slot) {
+        const int savedErrno = errno;
+        const bool readable = GuestCopyIn_nid_no_patch(&local, slot, sizeof(local));
+        errno = savedErrno;
+        if (!readable) APS5_INVALID_ARG_EX;
+    }
+    if (library) {
+        // The handle points at a host-side wrapper object with container
+        // members, so the probe is a plain fault-guarded read into a byte
+        // buffer; a copied GuestLibrary local would run container
+        // destructors on borrowed state.
+        alignas(FreeType::GuestLibrary) std::array<std::byte, sizeof(FreeType::GuestLibrary)> probe{};
+        const int savedErrno = errno;
+        const bool readable = GuestCopyIn_nid_no_patch(probe.data(), library, sizeof(probe));
+        errno = savedErrno;
+        if (!readable) APS5_INVALID_ARG_EX;
+    }
+    if (!library || !slot || !local.face || local.library != library) NotImplemented_nid_no_patch(function);
+    if (!SlotOwnedByLibrary(library, slot)) NotImplemented_nid_no_patch(function);
     return FT_Render_Glyph_nid_postfix(slot, renderMode);
 }
 
@@ -303,11 +347,21 @@ void APS5_VABI FT_Vector_Transform_Scaled_nid_postfix(FreeType::GuestVector* vec
     if (!vector || !matrix) {
         return;
     }
+    FreeType::GuestVector local{};
+    FreeType::GuestMatrix localMatrix{};
+    const int savedErrno = errno;
+    const bool readable = GuestCopyIn_nid_no_patch(&local, vector, sizeof(local)) &&
+                          GuestCopyIn_nid_no_patch(&localMatrix, matrix, sizeof(localMatrix));
+    errno = savedErrno;
+    if (!readable) APS5_INVALID_ARG_EX;
     const FreeType::GuestVector transformed{
-        ScaledSum(vector->x, matrix->xx, vector->y, matrix->xy, divisor, __func__),
-        ScaledSum(vector->x, matrix->yx, vector->y, matrix->yy, divisor, __func__),
+        ScaledSum(local.x, localMatrix.xx, local.y, localMatrix.xy, divisor, __func__),
+        ScaledSum(local.x, localMatrix.yx, local.y, localMatrix.yy, divisor, __func__),
     };
-    *vector = transformed;
+    const int savedWriteErrno = errno;
+    const bool written = GuestCopyOut_nid_no_patch(vector, &transformed, sizeof(transformed));
+    errno = savedWriteErrno;
+    if (!written) APS5_INVALID_ARG_EX;
 }
 
 std::int32_t APS5_VABI FT_SqrtFixed_nid_postfix(std::int32_t x) {
@@ -326,27 +380,46 @@ void APS5_VABI ft_synthesize_vertical_metrics_nid_postfix(FreeType::GuestGlyphMe
     if (!metrics) {
         return;
     }
-    std::int64_t height = metrics->height;
-    if (metrics->horiBearingY < 0) {
-        if (height < metrics->horiBearingY) {
-            height = metrics->horiBearingY;
+    FreeType::GuestGlyphMetrics local{};
+    const int savedErrno = errno;
+    const bool readable = GuestCopyIn_nid_no_patch(&local, metrics, sizeof(local));
+    errno = savedErrno;
+    if (!readable) APS5_INVALID_ARG_EX;
+    std::int64_t height = local.height;
+    if (local.horiBearingY < 0) {
+        if (height < local.horiBearingY) {
+            height = local.horiBearingY;
         }
-    } else if (metrics->horiBearingY > 0) {
-        height -= metrics->horiBearingY;
+    } else if (local.horiBearingY > 0) {
+        height -= local.horiBearingY;
     }
     if (!advance) {
         advance = height * 12 / 10;
     }
-    metrics->vertBearingX = metrics->horiBearingX - metrics->horiAdvance / 2;
-    metrics->vertBearingY = (advance - height) / 2;
-    metrics->vertAdvance = advance;
+    local.vertBearingX = local.horiBearingX - local.horiAdvance / 2;
+    local.vertBearingY = (advance - height) / 2;
+    local.vertAdvance = advance;
+    const int savedWriteErrno = errno;
+    const bool written = GuestCopyOut_nid_no_patch(metrics, &local, sizeof(local));
+    errno = savedWriteErrno;
+    if (!written) APS5_INVALID_ARG_EX;
 }
 
 void* APS5_VABI ft_service_list_lookup_nid_postfix(const GuestServiceDesc* descriptors, const char* service_id) {
     if (descriptors && service_id) {
-        for (; descriptors->serv_id; ++descriptors) {
-            if (std::strcmp(descriptors->serv_id, service_id) == 0) {
-                return descriptors->serv_data;
+        char id[128];
+        if (!CopyGuestZString(id, service_id, sizeof(id))) return nullptr;
+        for (std::size_t index = 0;; ++index) {
+            GuestServiceDesc entry{};
+            const int savedErrno = errno;
+            const bool readable = GuestCopyIn_nid_no_patch(&entry, descriptors + index, sizeof(entry));
+            errno = savedErrno;
+            if (!readable) return nullptr;
+            if (!entry.serv_id) break;
+            char name[128];
+            if (!CopyGuestZString(name, entry.serv_id, sizeof(name))) return nullptr;
+            if (std::strcmp(name, id) == 0) {
+                return entry.serv_data;
             }
         }
     }
