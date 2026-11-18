@@ -11,7 +11,8 @@ import progress
 ROOT = Path(__file__).resolve().parent.parent
 PRX = ROOT / "core" / "libs" / "prx"
 SAFE = {"GuestCopyIn_nid_no_patch": (0, 1), "GuestCopyOut_nid_no_patch": (0, 1), "CopyGuestString_nid_no_patch": (0,),
-        "CopyGuestPath_nid_no_patch": (0,), "CopyGuestEnvironment_nid_no_patch": (0,)}
+        "CopyGuestPath_nid_no_patch": (0,), "CopyGuestEnvironment_nid_no_patch": (0,),
+        "GuestWritable_nid_no_patch": (0,)}
 UNEVALUATED = ("sizeof", "alignof", "decltype", "noexcept")
 RAW_CALLS = {
     "memcpy": (0, 1), "memmove": (0, 1), "memset": (0,), "memcmp": (0, 1),
