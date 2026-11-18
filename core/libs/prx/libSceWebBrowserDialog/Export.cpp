@@ -101,7 +101,8 @@ int APS5_VABI sceWebBrowserDialogGetResult(WebBrowserDialogResult* result) {
     if (status == COMMON_DIALOG_STATUS_NONE) return COMMON_DIALOG_ERROR_NOT_INITIALIZED;
     if (status != COMMON_DIALOG_STATUS_FINISHED) return COMMON_DIALOG_ERROR_NOT_FINISHED;
     const std::int32_t canceled = COMMON_DIALOG_RESULT_USER_CANCELED;
-    if (!CopyOut(&result->result, &canceled, sizeof(canceled))) return COMMON_DIALOG_ERROR_ARG_NULL;
+    auto* resultSlot = reinterpret_cast<std::int32_t*>(reinterpret_cast<std::uintptr_t>(result) + offsetof(WebBrowserDialogResult, result));
+    if (!CopyOut(resultSlot, &canceled, sizeof(canceled))) return COMMON_DIALOG_ERROR_ARG_NULL;
     return 0;
 }
 
