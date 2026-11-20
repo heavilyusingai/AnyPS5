@@ -179,6 +179,9 @@ void TestAttr() {
         if (pthread_attr_setstackaddr_nid_postfix(nullptr, dummy) != GUEST_EINVAL) return false;
         if (pthread_attr_init_nid_postfix(&attr) != 0 || attr == nullptr) return false;
         if (pthread_attr_setstackaddr_nid_postfix(&attr, nullptr) != GUEST_EINVAL) return false;
+        errno = 71;
+        if (pthread_attr_setstackaddr_nid_postfix(reinterpret_cast<PthreadAttr*>(std::uintptr_t{0x10}), dummy) != GUEST_EINVAL) return false;
+        if (errno != 71) return false;
         if (pthread_attr_setstackaddr_nid_postfix(&attr, dummy) != 0) return false;
         void* retrieved = nullptr;
         if (pthread_attr_getstackaddr_nid_postfix(&attr, &retrieved) != 0 || retrieved != dummy) return false;
@@ -263,6 +266,9 @@ void TestAttr() {
             if (pthread_get_specificarray_np_nid_postfix(key, IntMax, nullptr) != GUEST_EINVAL) return false;
         }
         if (pthread_get_specificarray_np_nid_postfix(1, 1, nullptr) != GUEST_EFAULT) return false;
+        errno = 71;
+        if (pthread_get_specificarray_np_nid_postfix(1, 1, reinterpret_cast<void**>(std::uintptr_t{0x10})) != GUEST_EFAULT) return false;
+        if (errno != 71) return false;
         PthreadKey key1 = 0;
         PthreadKey key2 = 0;
         std::vector<PthreadKey> createdKeys;
