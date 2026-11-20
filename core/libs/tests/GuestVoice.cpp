@@ -106,6 +106,10 @@ int main() {
         Require(sceVoiceInit(&init, version) == invalidArgument);
         Require(sceVoiceGetResourceInfo(nullptr) == notInitialized);
     }
+    errno = 71;
+    Require(sceVoiceInit(reinterpret_cast<VoiceInitParam*>(std::uintptr_t{0x10}), 100) == invalidArgument);
+    Require(errno == 71);
+    Require(sceVoiceGetResourceInfo(nullptr) == notInitialized);
     VoiceStartParam start{};
     Require(sceVoiceStart(nullptr) == notInitialized);
     Require(sceVoiceStart(&start) == notInitialized);
