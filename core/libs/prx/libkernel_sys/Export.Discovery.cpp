@@ -269,8 +269,10 @@ int APS5_VABI pthread_attr_setcreatesuspend_np_nid_postfix(PthreadAttr* attr) {
 
 int APS5_VABI pthread_attr_setstackaddr_nid_postfix(PthreadAttr* attr, void* stack_addr) {
     constexpr int GuestEinval = 22;
-    if (!attr || !*attr || !stack_addr) return GuestEinval;
-    (*attr)->stackAddress = stack_addr;
+    if (!attr || !stack_addr) return GuestEinval;
+    PthreadAttr handle = nullptr;
+    if (!CopyInBytes(&handle, attr, sizeof(handle)) || !handle) return GuestEinval;
+    handle->stackAddress = stack_addr;
     return 0;
 }
 
@@ -281,7 +283,8 @@ int APS5_VABI pthread_get_specificarray_np_nid_postfix(PthreadKey key, int total
     if (total <= 0 || key < 1 || key > MaxKeys || total > MaxKeys - (key - 1)) return GuestEinval;
     if (!array) return GuestEfault;
     for (int i = 0; i < total; ++i) {
-        array[i] = scePthreadGetspecific(key + i);
+        void* value = scePthreadGetspecific(key + i);
+        if (!CopyOutBytes(array + i, &value, sizeof(value))) return GuestEfault;
     }
     return 0;
 }
