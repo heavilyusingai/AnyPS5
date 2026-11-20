@@ -36,7 +36,12 @@ bool CopyOut(void* destination, const void* source, std::size_t bytes) {
 extern "C" {
 
 int APS5_VABI freetypeLegacyLibrarySetLcdGeometry_nid_no_patch(FreeType::GuestLibrary* library, const FreeType::GuestVector* sub) {
-    const FT_Library host = library ? library->host : nullptr;
+    FT_Library host = nullptr;
+    if (library) {
+        const int savedErrno = errno;
+        GuestCopyIn_nid_no_patch(&host, &library->host, sizeof(host));
+        errno = savedErrno;
+    }
     if (!host || !sub) return FT_Library_SetLcdGeometry(host, nullptr);
     std::array<FreeType::GuestVector, 3> guest{};
     if (!CopyIn(guest.data(), sub, sizeof(guest))) return FT_Library_SetLcdGeometry(host, nullptr);

@@ -22,6 +22,16 @@ FT_Vector Vector(const FreeType::GuestVector& vector, const char* function) {
     return {static_cast<FT_Pos>(vector.x), static_cast<FT_Pos>(vector.y)};
 }
 
+// Face lookup for the probed library wrapper. The handle was already
+// fault-guard probed at the export boundary; this walks the host-side
+// face list for the slot whose bitmap mirrors the target.
+FreeType::GuestFace* FaceForBitmapTarget(FreeType::GuestLibrary* library, const FreeType::GuestBitmap* target) {
+    for (const auto& face : library->faces) {
+        if (target == &face->slot.bitmap && face->host != nullptr && face->host->glyph != nullptr) return face.get();
+    }
+    return nullptr;
+}
+
 FT_Bitmap Native(const FreeType::GuestBitmap& bitmap) {
     return {bitmap.rows, bitmap.width, bitmap.pitch, bitmap.buffer, bitmap.num_grays, bitmap.pixel_mode, bitmap.palette_mode, bitmap.palette};
 }
@@ -63,7 +73,12 @@ extern "C" {
 int APS5_VABI freetypeLegacyBitmapBlend_nid_no_patch(FreeType::GuestLibrary* library, const FreeType::GuestBitmap* source, FreeType::GuestVector sourceOffset,
                                                      FreeType::GuestBitmap* target, FreeType::GuestVector* targetOffset, LegacyFreeType::Color color) {
     const FT_Color nativeColor{color.blue, color.green, color.red, color.alpha};
-    const FT_Library host = library ? library->host : nullptr;
+    FT_Library host = nullptr;
+    if (library) {
+        const int savedErrno = errno;
+        GuestCopyIn_nid_no_patch(&host, &library->host, sizeof(host));
+        errno = savedErrno;
+    }
     if (!host || !source || !target || !targetOffset) return FT_Bitmap_Blend(nullptr, nullptr, {}, nullptr, nullptr, nativeColor);
     FreeType::GuestBitmap sourceRecord{};
     FreeType::GuestBitmap targetRecord{};
@@ -91,8 +106,8 @@ int APS5_VABI freetypeLegacyBitmapBlend_nid_no_patch(FreeType::GuestLibrary* lib
         return FT_Err_Invalid_Argument;
     }
     const FT_Error error = FT_Bitmap_Blend(host, &nativeSource, nativeSourceOffset, &nativeTarget, &nativeTargetOffset, nativeColor);
-    for (const auto& face : library->faces) {
-        if (target == &face->slot.bitmap && face->host != nullptr && face->host->glyph != nullptr) face->host->glyph->bitmap = nativeTarget;
+    if (auto* face = FaceForBitmapTarget(library, target)) {
+        face->host->glyph->bitmap = nativeTarget;
     }
     const FreeType::GuestVector resultOffset{nativeTargetOffset.x, nativeTargetOffset.y};
     if (!FreeTypeSyncBitmap_nid_no_patch(target, nativeTarget) || !CopyOut(targetOffset, &resultOffset, sizeof(resultOffset))) return FT_Err_Invalid_Argument;
