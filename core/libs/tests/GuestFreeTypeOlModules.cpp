@@ -40,6 +40,10 @@ static void APS5_VABI Release(GuestMemoryRec*, void* block) {
     std::free(block);
 }
 
+static void* APS5_VABI FailingAlloc(GuestMemoryRec*, std::int64_t) {
+    return nullptr;
+}
+
 static int gCountingFreeCalls = 0;
 
 static void APS5_VABI CountingRelease(GuestMemoryRec*, void*) {
@@ -95,6 +99,29 @@ static void TestModuleWrapperGuestPointers() {
     REQUIRE(errno == 71);
     REQUIRE(writableBlock == nullptr);
     REQUIRE(gCountingFreeCalls == 1);
+
+    const GuestMemoryRec memoryWithoutAlloc{nullptr, nullptr, Release, nullptr};
+    void* allocOut = &dummyAlloc;
+    errno = 71;
+    REQUIRE(sceFreeTypeOlAlloc_nid_postfix(unmappedMemory, 24, &allocOut) == 6);
+    REQUIRE(errno == 71);
+    REQUIRE(allocOut == nullptr);
+    allocOut = &dummyAlloc;
+    REQUIRE(sceFreeTypeOlAlloc_nid_postfix(const_cast<GuestMemoryRec*>(&memoryWithoutAlloc), 24, &allocOut) == 6);
+    REQUIRE(errno == 71);
+    REQUIRE(allocOut == nullptr);
+
+    errno = 71;
+    REQUIRE(sceFreeTypeOlAlloc_nid_postfix(const_cast<GuestMemoryRec*>(&memoryWithFree), 24, unmappedBlockPtr) == 6);
+    REQUIRE(errno == 71);
+
+    REQUIRE(sceFreeTypeOlAlloc_nid_postfix(const_cast<GuestMemoryRec*>(&memoryWithFree), 0, &allocOut) == 0);
+    REQUIRE(allocOut == nullptr);
+
+    const GuestMemoryRec memoryWithFailingAlloc{nullptr, FailingAlloc, Release, nullptr};
+    allocOut = &dummyAlloc;
+    REQUIRE(sceFreeTypeOlAlloc_nid_postfix(const_cast<GuestMemoryRec*>(&memoryWithFailingAlloc), 24, &allocOut) == 64);
+    REQUIRE(allocOut == nullptr);
 }
 
 int main() {
