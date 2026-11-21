@@ -5170,10 +5170,6 @@ double* APS5_VABI _ZN3sce4Json5Value9referRealEv(Value* self) {
     if (!ProbeNode(self, node) || node.type != TypeReal) return nullptr;
     return reinterpret_cast<double*>(reinterpret_cast<std::byte*>(self) + offsetof(Value, payload));
 }
-void* APS5_VABI _ZNK3sce4Json14InitParameter211getUserDataEv(const InitParameter2* self) { return self->userData; }
-void* APS5_VABI _ZNK3sce4Json14InitParameter212getAllocatorEv(const InitParameter2* self) { return self->allocator; }
-std::size_t APS5_VABI _ZNK3sce4Json14InitParameter217getFileBufferSizeEv(const InitParameter2* self) { return self->fileBufferSize; }
-std::int32_t APS5_VABI _ZNK3sce4Json14InitParameter225getSpecialFloatFormatTypeEv(const InitParameter2* self) { return self->specialFloatFormatType; }
 void* APS5_VABI _ZNK3sce4Json14InitParameter211getUserDataEv(const InitParameter2* self) { return LoadGuest<InitParameter2>(self, __func__).userData; }
 void* APS5_VABI _ZNK3sce4Json14InitParameter212getAllocatorEv(const InitParameter2* self) { return LoadGuest<InitParameter2>(self, __func__).allocator; }
 std::size_t APS5_VABI _ZNK3sce4Json14InitParameter217getFileBufferSizeEv(const InitParameter2* self) { return LoadGuest<InitParameter2>(self, __func__).fileBufferSize; }
