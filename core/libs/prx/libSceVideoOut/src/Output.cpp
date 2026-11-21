@@ -155,7 +155,12 @@ int APS5_VABI sceVideoOutGetDeviceCapabilityInfo_(int handle, void* info, std::u
     if (!VideoOutDriver::Get().HasConfig(handle)) return VIDEO_OUT_ERROR_INVALID_HANDLE;
     if (info == nullptr || size != sizeof(std::uint64_t)) return VIDEO_OUT_ERROR_INVALID_VALUE;
     const std::uint64_t capabilities = 1;
-    std::memcpy(info, &capabilities, sizeof(capabilities));
+    {
+        const int savedErrno = errno;
+        const bool written = GuestCopyOut_nid_no_patch(info, &capabilities, sizeof(capabilities));
+        errno = savedErrno;
+        if (!written) return VIDEO_OUT_ERROR_INVALID_VALUE;
+    }
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
@@ -165,8 +170,27 @@ void APS5_VABI sceVideoOutModeSetAny_(void* mode, std::uint32_t size) {
     if (mode == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
     }
-    std::memcpy(mode, &size, sizeof(size));
-    if (size > sizeof(size)) std::memset(static_cast<std::byte*>(mode) + sizeof(size), 0xFF, size - sizeof(size));
+    const std::uint32_t prefix = size;
+    {
+        const int savedErrno = errno;
+        const bool written = GuestCopyOut_nid_no_patch(mode, &prefix, sizeof(prefix));
+        errno = savedErrno;
+        if (!written) {
+            throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
+        }
+    }
+    std::array<std::uint8_t, 64> fill{};
+    fill.fill(0xFF);
+    for (std::uint32_t offset = sizeof(size); offset < size;) {
+        const std::uint32_t count = std::min<std::uint32_t>(static_cast<std::uint32_t>(fill.size()), size - offset);
+        const int savedErrno = errno;
+        const bool written = GuestCopyOut_nid_no_patch(static_cast<std::byte*>(mode) + offset, fill.data(), count);
+        errno = savedErrno;
+        if (!written) {
+            throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
+        }
+        offset += count;
+    }
 }
 
 int APS5_VABI sceVideoOutAllowOutputResolutionWqhdDetection(int handle) try {
@@ -207,9 +231,16 @@ int APS5_VABI sceVideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) t
     if (cfg->ps4) {
         const auto& current = cfg->flipStatus;
         VideoOutFlipStatusPs4 legacy{current.count, current.processTime, 0, current.flipArg, 0, 0, current.gcQueueNum, current.flipPendingNum, current.currentBuffer, 0};
-        *reinterpret_cast<VideoOutFlipStatusPs4*>(status) = legacy;
+        const int savedErrno = errno;
+        const bool written = GuestCopyOut_nid_no_patch(status, &legacy, sizeof(legacy));
+        errno = savedErrno;
+        if (!written) return VIDEO_OUT_ERROR_INVALID_ADDRESS;
     } else {
-        *status = cfg->flipStatus;
+        const VideoOutFlipStatus current = cfg->flipStatus;
+        const int savedErrno = errno;
+        const bool written = GuestCopyOut_nid_no_patch(status, &current, sizeof(current));
+        errno = savedErrno;
+        if (!written) return VIDEO_OUT_ERROR_INVALID_ADDRESS;
     }
     return 0;
 } catch (const ProcessShutdown&) {
@@ -229,9 +260,16 @@ int APS5_VABI sceVideoOutGetVblankStatus(int handle, VideoOutVblankStatus* statu
     if (cfg->ps4) {
         const auto& current = cfg->vblankStatus;
         VideoOutVblankStatusPs4 legacy{current.count, current.processTime, 0, current.flags};
-        *reinterpret_cast<VideoOutVblankStatusPs4*>(status) = legacy;
+        const int savedErrno = errno;
+        const bool written = GuestCopyOut_nid_no_patch(status, &legacy, sizeof(legacy));
+        errno = savedErrno;
+        if (!written) return VIDEO_OUT_ERROR_INVALID_ADDRESS;
     } else {
-        *status = cfg->vblankStatus;
+        const VideoOutVblankStatus current = cfg->vblankStatus;
+        const int savedErrno = errno;
+        const bool written = GuestCopyOut_nid_no_patch(status, &current, sizeof(current));
+        errno = savedErrno;
+        if (!written) return VIDEO_OUT_ERROR_INVALID_ADDRESS;
     }
     return 0;
 } catch (const ProcessShutdown&) {
@@ -248,7 +286,13 @@ int APS5_VABI sceVideoOutGetOutputStatus(int handle, VideoOutOutputStatus* statu
     }
     std::unique_lock lock(cfg->mutex);
     cfg->Check();
-    *status = outputStatus(*cfg);
+    const auto current = outputStatus(*cfg);
+    {
+        const int savedErrno = errno;
+        const bool written = GuestCopyOut_nid_no_patch(status, &current, sizeof(current));
+        errno = savedErrno;
+        if (!written) return VIDEO_OUT_ERROR_INVALID_ADDRESS;
+    }
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
@@ -266,7 +310,12 @@ int APS5_VABI sceVideoOutGetOutputStatusWithVrr(int handle, void* status) try {
     std::array<std::byte, 80> bytes{};
     const auto output = outputStatus(*cfg);
     std::memcpy(bytes.data(), &output, sizeof(output));
-    std::memcpy(status, bytes.data(), bytes.size());
+    {
+        const int savedErrno = errno;
+        const bool written = GuestCopyOut_nid_no_patch(status, bytes.data(), bytes.size());
+        errno = savedErrno;
+        if (!written) return VIDEO_OUT_ERROR_INVALID_ADDRESS;
+    }
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
@@ -282,12 +331,18 @@ int APS5_VABI sceVideoOutGetResolutionStatus(int handle, VideoOutResolutionStatu
     }
     std::unique_lock lock(cfg->mutex);
     cfg->Check();
-    *status = VideoOutResolutionStatus{};
-    status->fullWidth = cfg->width;
-    status->fullHeight = cfg->height;
-    status->paneWidth = cfg->width;
-    status->paneHeight = cfg->height;
-    status->refreshRate = (cfg->outputMode == VIDEO_OUT_OUTPUT_MODE_119_88HZ) ? VIDEO_OUT_REFRESH_RATE_119_88HZ : VIDEO_OUT_REFRESH_RATE_59_94HZ;
+    VideoOutResolutionStatus current{};
+    current.fullWidth = cfg->width;
+    current.fullHeight = cfg->height;
+    current.paneWidth = cfg->width;
+    current.paneHeight = cfg->height;
+    current.refreshRate = (cfg->outputMode == VIDEO_OUT_OUTPUT_MODE_119_88HZ) ? VIDEO_OUT_REFRESH_RATE_119_88HZ : VIDEO_OUT_REFRESH_RATE_59_94HZ;
+    {
+        const int savedErrno = errno;
+        const bool written = GuestCopyOut_nid_no_patch(status, &current, sizeof(current));
+        errno = savedErrno;
+        if (!written) return VIDEO_OUT_ERROR_INVALID_ADDRESS;
+    }
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();

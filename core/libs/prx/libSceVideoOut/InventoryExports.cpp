@@ -462,14 +462,22 @@ int APS5_VABI sceVideoOutSysHdmiMonitorInfoIsMorpheus() {
 }
 
 void APS5_VABI sceVideoOutSysInitMode(void* mode) {
-    std::memset(mode, 0xFF, 0x20);
+    std::array<std::uint8_t, 0x20> image{};
+    image.fill(0xFF);
     const std::uint32_t size = 0x20;
-    std::memcpy(mode, &size, sizeof(size));
+    std::memcpy(image.data(), &size, sizeof(size));
+    const int savedErrno = errno;
+    const bool written = GuestCopyOut_nid_no_patch(mode, image.data(), image.size());
+    errno = savedErrno;
+    (void)written;
 }
 
 int APS5_VABI sceVideoOutSysIsModeS3d(const void* mode) {
-    std::uint64_t value;
-    std::memcpy(&value, static_cast<const std::uint8_t*>(mode) + 0x10, sizeof(value));
+    std::uint64_t value = 0;
+    const int savedErrno = errno;
+    const bool readable = GuestCopyIn_nid_no_patch(&value, static_cast<const std::uint8_t*>(mode) + 0x10, sizeof(value));
+    errno = savedErrno;
+    if (!readable) return 0;
     return value - 0xA0u < 2u || value == 0xFFFFFFFF81FFFFFFull ? 1 : 0;
 }
 
@@ -494,7 +502,11 @@ int APS5_VABI sceVideoOutSysIsUserStatusVr() {
 }
 
 int APS5_VABI sceVideoOutSysModeIsHdr(const void* mode) {
-    const auto value = static_cast<const std::uint8_t*>(mode)[6];
+    std::uint8_t value = 0;
+    const int savedErrno = errno;
+    const bool readable = GuestCopyIn_nid_no_patch(&value, static_cast<const std::uint8_t*>(mode) + 6, sizeof(value));
+    errno = savedErrno;
+    if (!readable) return 0;
     return static_cast<std::uint8_t>(value - 12u) < 6u ? 1 : 0;
 }
 

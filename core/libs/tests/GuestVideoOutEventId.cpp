@@ -126,6 +126,9 @@ int main() {
         passed = false;
     }
     passed = Throws("sceVideoOutGetEventCount of a null event", [] { return sceVideoOutGetEventCount(nullptr); }) && passed;
+    errno = 71;
+    passed = Throws("sceVideoOutGetEventCount of an unreadable event", [] { return sceVideoOutGetEventCount(reinterpret_cast<const KernelEvent*>(std::uintptr_t{0x10})); }) && passed;
+    passed = passed && errno == 71;
     if (!passed) return 1;
     std::printf("guest VideoOut event getter tests passed\n");
     return 0;
