@@ -6,28 +6,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <string>
 #include "SceTypes.hpp"
 #include "prx/libSceFreeTypeOt/include/Calc.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libSceFreeTypeOt/libSceFreeTypeOt.hpp"
 
 namespace {
-
-// Copies a guest NUL-terminated string into a fixed buffer. Refuses
-// strings that do not terminate within the capacity, mirroring the
-// bounded-copy convention.
-bool CopyGuestZString(char* destination, const char* source, std::size_t capacity) {
-    for (std::size_t index = 0; index < capacity; ++index) {
-        char unit = 0;
-        const int savedErrno = errno;
-        const bool copied = GuestCopyIn_nid_no_patch(&unit, source + index, sizeof(unit));
-        errno = savedErrno;
-        if (!copied) return false;
-        destination[index] = unit;
-        if (!unit) return true;
-    }
-    return false;
-}
 
 // Ownership scan for the probed library handle. The handle was already
 // fault-guard probed at the export boundary; this walks the host-side face
@@ -407,8 +392,8 @@ void APS5_VABI ft_synthesize_vertical_metrics_nid_postfix(FreeType::GuestGlyphMe
 
 void* APS5_VABI ft_service_list_lookup_nid_postfix(const GuestServiceDesc* descriptors, const char* service_id) {
     if (descriptors && service_id) {
-        char id[128];
-        if (!CopyGuestZString(id, service_id, sizeof(id))) return nullptr;
+        std::string id;
+        if (CopyGuestString_nid_no_patch(service_id, 128, id) != 0) return nullptr;
         for (std::size_t index = 0;; ++index) {
             GuestServiceDesc entry{};
             const int savedErrno = errno;
@@ -416,9 +401,9 @@ void* APS5_VABI ft_service_list_lookup_nid_postfix(const GuestServiceDesc* descr
             errno = savedErrno;
             if (!readable) return nullptr;
             if (!entry.serv_id) break;
-            char name[128];
-            if (!CopyGuestZString(name, entry.serv_id, sizeof(name))) return nullptr;
-            if (std::strcmp(name, id) == 0) {
+            std::string name;
+            if (CopyGuestString_nid_no_patch(entry.serv_id, 128, name) != 0) return nullptr;
+            if (name == id) {
                 return entry.serv_data;
             }
         }
