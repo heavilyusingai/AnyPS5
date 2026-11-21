@@ -31,6 +31,10 @@ function reportFor(item, index) {
   };
 }
 
+async function sha256Hex(bytes) {
+  return [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
 export async function downloadLibraries(target, locale = "en") {
   if (target !== "linux" && target !== "windows") throw new Error(translate(locale, "invalidLibraryTarget"));
   report({ phase: translate(locale, "phaseDownloadingLibraries") });
@@ -51,6 +55,19 @@ export async function downloadLibraries(target, locale = "en") {
   } else {
     const latest = await latestResponse.json();
     if (latest.tag_name !== release.tag) throw new Error(translate(locale, "releasePublishing"));
+  }
+  const cache = self.caches ? await self.caches.open("anyps5-libraries-v1") : null;
+  if (cache) {
+    const hit = await cache.match(asset.path).catch(() => null);
+    if (hit) {
+      const bytes = new Uint8Array(await hit.arrayBuffer());
+      const digest = bytes.byteLength === asset.size ? await sha256Hex(bytes) : "";
+      if (digest === asset.sha256) {
+        report({ phase: translate(locale, "phaseCachedLibraries"), completed: asset.size, total: asset.size });
+        return { file: new Blob([bytes]), release, expandedBytes: asset.expandedBytes };
+      }
+      await cache.delete(asset.path).catch(() => {});
+    }
   }
   const download = await fetch(asset.path);
   if (!download.ok) throw new Error(translate(locale, "cannotDownloadLibraries", { status: download.status }));
@@ -76,8 +93,9 @@ export async function downloadLibraries(target, locale = "en") {
   const bytes = new Uint8Array(size);
   let offset = 0;
   for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-  const digest = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(byte => byte.toString(16).padStart(2, "0")).join("");
+  const digest = await sha256Hex(bytes);
   if (digest !== asset.sha256) throw new Error(translate(locale, "checksumMismatch"));
+  if (cache) await cache.put(asset.path, new Response(new Blob([bytes]))).catch(() => {});
   return { file: new Blob([bytes]), release, expandedBytes: asset.expandedBytes };
 }
 

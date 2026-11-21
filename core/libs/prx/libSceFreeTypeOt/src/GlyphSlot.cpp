@@ -8,11 +8,14 @@
 #include "prx/libSceFreeTypeOt/include/Memory.hpp"
 #include "prx/libc/include/General.hpp"
 
+#include <cerrno>
 #include <cstdint>
 
 using namespace FreeType;
 
 namespace {
+
+constexpr int InvalidArgument = 0x06;
 
 GuestSlotInternalRec* Internal(GuestGlyphSlotRec* slot) {
     return static_cast<GuestSlotInternalRec*>(slot->internal);
@@ -25,7 +28,7 @@ GuestMemoryRec* FaceMemory(GuestGlyphSlotRec* slot, const char* function) {
 
 void FreeOwned(GuestMemoryRec* memory, GuestGlyphSlotRec* slot, const char* function) {
     if (slot->bitmap.buffer && !memory) NotImplemented_nid_no_patch(function);
-    ft_mem_free_nid_postfix(memory, slot->bitmap.buffer);
+    OtMemFree(memory, slot->bitmap.buffer);
     slot->bitmap.buffer = nullptr;
 }
 
@@ -40,22 +43,175 @@ void FreeBitmap(GuestGlyphSlotRec* slot, const char* function) {
     }
 }
 
+GuestDriverRec* DriverOf(GuestGlyphSlotRec* slot, const char* function) {
+    auto* face = static_cast<GuestFaceRec*>(slot->face);
+    if (!face || !face->driver) NotImplementedAt_nid_no_patch(function, __FILE__, __LINE__);
+    auto* driver = static_cast<GuestDriverRec*>(face->driver);
+    if (!driver->clazz) NotImplementedAt_nid_no_patch(function, __FILE__, __LINE__);
+    return driver;
+}
+
+bool UsesOutlines(const GuestDriverRec* driver, const char* function) {
+    if (!driver->root_clazz) NotImplementedAt_nid_no_patch(function, __FILE__, __LINE__);
+    return !(driver->root_clazz->module_flags & ModuleDriverNoOutlines);
+}
+
+void* Allocate(GuestMemoryRec* memory, std::int64_t size, std::int32_t* error, const char* function) {
+    if (size > 0 && !memory) NotImplementedAt_nid_no_patch(function, __FILE__, __LINE__);
+    return ft_mem_alloc_nid_postfix(memory, size, error);
+}
+
+void Free(GuestMemoryRec* memory, const void* block, const char* function) {
+    if (block && !memory) NotImplementedAt_nid_no_patch(function, __FILE__, __LINE__);
+    ft_mem_free_nid_postfix(memory, block);
+}
+
+void LoaderDone(GuestGlyphLoaderRec* loader, const char* function) {
+    if (!loader) return;
+    GuestMemoryRec* memory = loader->memory;
+    Free(memory, loader->base.outline.points, function);
+    Free(memory, loader->base.outline.tags, function);
+    Free(memory, loader->base.outline.contours, function);
+    Free(memory, loader->base.extra_points, function);
+    Free(memory, loader->base.subglyphs, function);
+    Free(memory, loader, function);
+}
+
+std::int32_t SlotInit(GuestGlyphSlotRec* slot, const char* function) {
+    GuestDriverRec* driver = DriverOf(slot, function);
+    GuestDriverClassPrefix* clazz = driver->clazz;
+    GuestMemoryRec* memory = driver->root_memory;
+    slot->library = driver->root_library;
+    std::int32_t error = 0;
+    auto* internal = static_cast<GuestSlotInternalRec*>(Allocate(memory, sizeof(GuestSlotInternalRec), &error, function));
+    if (error) return error;
+    slot->internal = internal;
+    if (UsesOutlines(driver, function)) {
+        auto* loader = static_cast<GuestGlyphLoaderRec*>(Allocate(memory, sizeof(GuestGlyphLoaderRec), &error, function));
+        if (!error) {
+            loader->memory = memory;
+            internal->loader = loader;
+        }
+    }
+    if (!error && clazz->init_slot) error = clazz->init_slot(slot);
+    return error;
+}
+
+void SlotDone(GuestGlyphSlotRec* slot, const char* function) {
+    GuestDriverRec* driver = DriverOf(slot, function);
+    GuestDriverClassPrefix* clazz = driver->clazz;
+    GuestMemoryRec* memory = driver->root_memory;
+    if (clazz->done_slot) clazz->done_slot(slot);
+    FreeBitmap(slot, function);
+    GuestSlotInternalRec* internal = Internal(slot);
+    if (!internal) return;
+    if (UsesOutlines(driver, function)) {
+        LoaderDone(static_cast<GuestGlyphLoaderRec*>(internal->loader), function);
+        internal->loader = nullptr;
+    }
+    Free(memory, internal, function);
+}
+
 }
 
 extern "C" {
+
+int APS5_VABI FT_New_GlyphSlot_nid_postfix(GuestFaceRec* face, GuestGlyphSlotRec** aslot) {
+    const char* function = __func__;
+    GuestFaceRec local{};
+    if (face) {
+        const int savedErrno = errno;
+        const bool readable = GuestCopyIn_nid_no_patch(&local, face, sizeof(local));
+        errno = savedErrno;
+        if (!readable) return InvalidArgument;
+    }
+    if (!face || !local.driver) return InvalidArgument;
+    auto* driver = static_cast<GuestDriverRec*>(local.driver);
+    if (!driver->clazz) NotImplementedAt_nid_no_patch(function, __FILE__, __LINE__);
+    GuestMemoryRec* memory = driver->root_memory;
+    const std::int64_t size = driver->clazz->slot_object_size;
+    if (size >= 0 && size < static_cast<std::int64_t>(sizeof(GuestGlyphSlotRec))) NotImplementedAt_nid_no_patch(function, __FILE__, __LINE__);
+    std::int32_t error = 0;
+    auto* slot = static_cast<GuestGlyphSlotRec*>(Allocate(memory, size, &error, function));
+    if (error) {
+        if (aslot) {
+            GuestGlyphSlotRec* published = nullptr;
+            const int savedPublishErrno = errno;
+            const bool wrote = GuestCopyOut_nid_no_patch(aslot, &published, sizeof(published));
+            errno = savedPublishErrno;
+            if (!wrote) return error;
+        }
+        return error;
+    }
+    slot->face = face;
+    error = SlotInit(slot, function);
+    if (error) {
+        SlotDone(slot, function);
+        Free(memory, slot, function);
+        return error;
+    }
+    slot->next = local.glyph;
+    GuestGlyphSlotRec* linked = slot;
+    {
+        const int savedLinkErrno = errno;
+        const bool linked_ok = GuestCopyOut_nid_no_patch(&face->glyph, &linked, sizeof(linked));
+        errno = savedLinkErrno;
+        if (!linked_ok) {
+            SlotDone(slot, function);
+            Free(memory, slot, function);
+            return InvalidArgument;
+        }
+    }
+    if (aslot) {
+        GuestGlyphSlotRec* published = slot;
+        const int savedPublishErrno = errno;
+        const bool wrote = GuestCopyOut_nid_no_patch(aslot, &published, sizeof(published));
+        errno = savedPublishErrno;
+        // The slot is already linked as the face's glyph, so a refused
+        // publish returns the error without freeing it.
+        if (!wrote) return InvalidArgument;
+    }
+    return 0;
+}
 
 void APS5_VABI ft_glyphslot_free_bitmap_nid_postfix(GuestGlyphSlotRec* slot) {
     FreeBitmap(slot, __func__);
 }
 
 void APS5_VABI ft_glyphslot_set_bitmap_nid_postfix(GuestGlyphSlotRec* slot, std::uint8_t* buffer) {
+    if (!slot) NotImplemented_nid_no_patch(__func__);
+    {
+        GuestGlyphSlotRec head{};
+        const int savedErrno = errno;
+        const bool readable = GuestCopyIn_nid_no_patch(&head, slot, sizeof(head));
+        errno = savedErrno;
+        if (!readable) NotImplemented_nid_no_patch(__func__);
+    }
     FreeBitmap(slot, __func__);
-    slot->bitmap.buffer = buffer;
+    GuestBitmap bitmap{};
+    {
+        const int savedErrno = errno;
+        const bool readable = GuestCopyIn_nid_no_patch(&bitmap, &slot->bitmap, sizeof(bitmap));
+        errno = savedErrno;
+        if (!readable) return;
+    }
+    bitmap.buffer = buffer;
+    const int savedWriteErrno = errno;
+    const bool written = GuestCopyOut_nid_no_patch(&slot->bitmap, &bitmap, sizeof(bitmap));
+    errno = savedWriteErrno;
+    if (!written) return;
 }
 
 int APS5_VABI ft_glyphslot_alloc_bitmap_nid_postfix(GuestGlyphSlotRec* slot, std::uint64_t size) {
     const char* function = __func__;
-    if (!slot || !slot->internal) NotImplemented_nid_no_patch(function);
+    if (slot) {
+        void* internalHandle = nullptr;
+        const int savedErrno = errno;
+        const bool readable = GuestCopyIn_nid_no_patch(&internalHandle, &slot->internal, sizeof(internalHandle));
+        errno = savedErrno;
+        if (!readable || !internalHandle) NotImplemented_nid_no_patch(function);
+    }
+    if (!slot) NotImplemented_nid_no_patch(function);
     GuestMemoryRec* memory = FaceMemory(slot, function);
     GuestSlotInternalRec* internal = Internal(slot);
     if (internal->flags & GlyphOwnBitmap) {
@@ -66,8 +222,22 @@ int APS5_VABI ft_glyphslot_alloc_bitmap_nid_postfix(GuestGlyphSlotRec* slot, std
     const auto bytes = static_cast<std::int64_t>(size);
     if (bytes > 0 && !memory) NotImplemented_nid_no_patch(function);
     std::int32_t error = 0;
-    slot->bitmap.buffer = static_cast<unsigned char*>(ft_mem_alloc_nid_postfix(memory, bytes, &error));
-    return error;
+    GuestBitmap bitmap{};
+    {
+        const int savedErrno = errno;
+        const bool readable = GuestCopyIn_nid_no_patch(&bitmap, &slot->bitmap, sizeof(bitmap));
+        errno = savedErrno;
+        if (!readable) NotImplemented_nid_no_patch(function);
+    }
+    bitmap.buffer = static_cast<unsigned char*>(OtMemAlloc(memory, bytes, &error));
+    if (error) return error;
+    {
+        const int savedWriteErrno = errno;
+        const bool written = GuestCopyOut_nid_no_patch(&slot->bitmap, &bitmap, sizeof(bitmap));
+        errno = savedWriteErrno;
+        if (!written) return InvalidArgument;
+    }
+    return 0;
 }
 
 }
