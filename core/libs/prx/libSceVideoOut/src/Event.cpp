@@ -231,7 +231,16 @@ int APS5_VABI sceVideoOutGetEventCount(const KernelEvent* ev) {
     if (ev == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
     }
-    return static_cast<int>((static_cast<uint64_t>(ev->data) >> 12u) & 0xfu);
+    std::int64_t data = 0;
+    {
+        const int savedErrno = errno;
+        const bool readable = GuestCopyIn_nid_no_patch(&data, reinterpret_cast<const std::byte*>(ev) + offsetof(KernelEvent, data), sizeof(data));
+        errno = savedErrno;
+        if (!readable) {
+            throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
+        }
+    }
+    return static_cast<int>((static_cast<uint64_t>(data) >> 12u) & 0xfu);
 }
 
 }

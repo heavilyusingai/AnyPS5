@@ -49,6 +49,10 @@ int main() {
     std::memset(&attr2, 0x5A, sizeof(attr2));
 
     ExpectFailure([] { sceVideoOutSetBufferAttribute2(nullptr, 1, 0, 1920, 1080, 0, 0, 0); });
+    ExpectFailure([] { sceVideoOutSetBufferAttribute2(reinterpret_cast<VideoOutBufferAttribute2*>(std::uintptr_t{0x10}), 1, 0, 1920, 1080, 0, 0, 0); });
+    ExpectFailure([] { sceVideoOutAddBufferAttributeOption(reinterpret_cast<VideoOutBufferAttribute2*>(std::uintptr_t{0x10}), 1); });
+    ExpectFailure([] { sceVideoOutRemoveBufferAttributeOption(reinterpret_cast<VideoOutBufferAttribute2*>(std::uintptr_t{0x10}), 1); });
+    ExpectFailure([] { sceVideoOutSetBufferAttribute(reinterpret_cast<VideoOutBufferAttribute*>(std::uintptr_t{0x10}), 0, 0, 0, 1920, 1080, 0); });
 
     sceVideoOutSetBufferAttribute2(&attr2, 1, 0, 1920, 1080, 0, 0, 0);
     Require(attr2.pixel_format == 1);

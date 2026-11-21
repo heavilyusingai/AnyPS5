@@ -2,6 +2,7 @@
 #include "prx/libSceVideoOut/include/LaterExports.hpp"
 #include <array>
 #include <cstddef>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -120,6 +121,14 @@ static void CheckContentSetters() {
 }
 
 int main() {
+    errno = 71;
+    sceVideoOutSysInitMode(reinterpret_cast<void*>(std::uintptr_t{0x10}));
+    Require(errno == 71, "SysInitMode keeps the caller errno on an unwritable mode");
+    Require(sceVideoOutSysIsModeS3d(reinterpret_cast<const void*>(std::uintptr_t{0x10})) == 0, "SysIsModeS3d reports no s3d for an unreadable mode");
+    Require(errno == 71, "SysIsModeS3d keeps the caller errno");
+    Require(sceVideoOutSysModeIsHdr(reinterpret_cast<const void*>(std::uintptr_t{0x10})) == 0, "SysModeIsHdr reports no hdr for an unreadable mode");
+    Require(errno == 71, "SysModeIsHdr keeps the caller errno");
+
     Require(sceVideoOutAddBufferHdrPrivilege() == 0, "sceVideoOutAddBufferHdrPrivilege did not return 0");
     Require(sceVideoOutRazorRecallCallbacks() == 0, "sceVideoOutRazorRecallCallbacks did not return 0");
     Require(sceVideoOutSysUpdateRenderingMode() == 0, "sceVideoOutSysUpdateRenderingMode did not return 0");
