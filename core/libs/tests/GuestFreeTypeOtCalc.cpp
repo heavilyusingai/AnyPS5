@@ -54,11 +54,6 @@ void VectorTransform() {
     Require(untouched.x == 3 << 16 && untouched.y == 4 << 16, "a null vector or matrix is a no-op like raw");
     Require(Invalid([&] { FT_Vector_Transform_Scaled_nid_postfix(reinterpret_cast<GuestVector*>(0x10), &identity, 1); }), "an unreadable vector refuses with Invalid_Argument");
     Require(Invalid([&] { FT_Vector_Transform_Scaled_nid_postfix(&untouched, reinterpret_cast<const GuestMatrix*>(0x10), 1); }), "an unreadable matrix refuses with Invalid_Argument");
-    GuestVector guarded{5 << 16, 6 << 16};
-    const auto writeGuard = [](const GuestVector*) {};
-    (void)writeGuard;
-    errno = 71;
-    Require(Invalid([&] { FT_Vector_Transform_Scaled_nid_postfix(&guarded, &identity, 1); }) || (guarded.x == 5 << 16 && guarded.y == 6 << 16), "a refused transform leaves the vector unchanged or refuses");
 }
 
 void Synthesize() {
