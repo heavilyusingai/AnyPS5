@@ -376,11 +376,19 @@ GuestResolver::ServiceEntry* APS5_VABI getservbyname_nid_postfix(const char* gue
 
 void APS5_VABI freeaddrinfo_nid_postfix(GuestResolver::AddressInfo* first) {
     while (first) {
-        auto* next = first->next;
-        std::free(first->canonicalName);
-        std::free(first->address);
+        // The chain nodes are host allocations handed to the guest by
+        // getaddrinfo, so each node is fault-guard probed before its
+        // members are freed; an unreadable node stops the walk instead
+        // of faulting the host on a forged chain.
+        GuestResolver::AddressInfo node{};
+        {
+            const SavedErrno savedErrno;
+            if (!GuestCopyIn_nid_no_patch(&node, first, sizeof(node))) return;
+        }
+        std::free(node.canonicalName);
+        std::free(node.address);
         std::free(first);
-        first = next;
+        first = node.next;
     }
 }
 
@@ -420,21 +428,21 @@ int APS5_VABI getaddrinfo_nid_postfix(const char* node, const char* service,
     } catch (const std::bad_alloc&) {
         return 6;
     }
-    if (node) node = nodeCopy.c_str();
-    if (service) service = serviceCopy.c_str();
+    const char* nodeName = node ? nodeCopy.c_str() : nullptr;
+    const char* serviceName = service ? serviceCopy.c_str() : nullptr;
     const char* numericName = nullptr;
-    if (node && hints && (hints->flags & 2)) {
+    if (nodeName && hints && (hints->flags & 2)) {
         std::array<unsigned char, 4> v4{};
         std::array<unsigned char, 16> v6{};
-        const char* scope = std::strchr(node, '%');
-        const std::size_t length = scope ? static_cast<std::size_t>(scope - node) : std::strlen(node);
+        const char* scope = std::strchr(nodeName, '%');
+        const std::size_t length = scope ? static_cast<std::size_t>(scope - nodeName) : std::strlen(nodeName);
         std::array<char, 64> address{};
         bool numericV6 = false;
         if (length < address.size()) {
-            std::memcpy(address.data(), node, length);
+            std::memcpy(address.data(), nodeName, length);
             numericV6 = inet_pton(AF_INET6, address.data(), v6.data()) == 1;
         }
-        if ((hints->flags & 4) || NumericAddress(node, v4) || numericV6) numericName = node;
+        if ((hints->flags & 4) || NumericAddress(nodeName, v4) || numericV6) numericName = nodeName;
     }
     std::array<addrinfo, 2> queries{nativeHints, nativeHints};
     std::size_t queryCount = 1;
@@ -460,7 +468,7 @@ int APS5_VABI getaddrinfo_nid_postfix(const char* node, const char* service,
     int lookupFailure = 0;
     for (std::size_t query = 0; query < queryCount; ++query) {
         addrinfo* native = nullptr;
-        const auto error = ::getaddrinfo(node, service, &queries[query], &native);
+        const auto error = ::getaddrinfo(nodeName, serviceName, &queries[query], &native);
         if (error) {
             if (error == EAI_SERVICE) { lookupFailure = 9; continue; }
             failure = GuestError(error);
@@ -559,8 +567,14 @@ int APS5_VABI getnameinfo_nid_postfix(const void* address, std::uint32_t length,
     if (error) return GuestError(error);
     if ((wantHost && std::strlen(resolvedHost) >= hostLength) ||
         (wantService && std::strlen(resolvedService) >= serviceLength)) return 14;
-    if (wantHost) std::memcpy(host, resolvedHost, std::strlen(resolvedHost) + 1);
-    if (wantService) std::memcpy(service, resolvedService, std::strlen(resolvedService) + 1);
+    if (wantHost) {
+        const SavedErrno savedErrno;
+        if (!GuestCopyOut_nid_no_patch(host, resolvedHost, std::strlen(resolvedHost) + 1)) return 14;
+    }
+    if (wantService) {
+        const SavedErrno savedErrno;
+        if (!GuestCopyOut_nid_no_patch(service, resolvedService, std::strlen(resolvedService) + 1)) return 14;
+    }
     return 0;
 }
 
