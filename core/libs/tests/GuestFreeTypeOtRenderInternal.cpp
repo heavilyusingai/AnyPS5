@@ -3,6 +3,7 @@
 #include <ft2build.h>
 #include FT_FREETYPE_H
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -76,6 +77,12 @@ int main() {
         Require(Throws([&] { FT_Render_Glyph_Internal_nid_postfix(library, nullptr, mode); }), "null slot throws");
         GuestGlyphSlotRec copy = *slot;
         Require(Throws([&] { FT_Render_Glyph_Internal_nid_postfix(library, &copy, mode); }), "unregistered slot throws");
+        errno = 71;
+        Require(Throws([&] { FT_Render_Glyph_Internal_nid_postfix(library, reinterpret_cast<GuestGlyphSlotRec*>(0x10), mode); }), "an unreadable slot throws invalid argument");
+        Require(errno == 71, "an unreadable slot keeps the caller errno");
+        errno = 71;
+        Require(Throws([&] { FT_Render_Glyph_Internal_nid_postfix(reinterpret_cast<GuestLibrary*>(0x10), slot, mode); }), "an unreadable library throws invalid argument");
+        Require(errno == 71, "an unreadable library keeps the caller errno");
         Close(face);
     }
     Require(FT_Done_FreeType_nid_postfix(other) == 0 && FT_Done_FreeType_nid_postfix(library) == 0 && FT_Done_FreeType(native) == 0, "release libraries");

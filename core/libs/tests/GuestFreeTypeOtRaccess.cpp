@@ -1,9 +1,11 @@
 #include "prx/libSceFreeTypeOt/include/Memory.hpp"
 #include "prx/libSceFreeTypeOt/include/Raccess.hpp"
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -39,6 +41,16 @@ void Require(bool condition, const char* message) {
     if (condition) return;
     std::fprintf(stderr, "FreeType Ot raccess: %s\n", message);
     std::exit(1);
+}
+
+template <typename TCall>
+bool Throws(TCall call) {
+    try {
+        call();
+    } catch (const std::exception&) {
+        return true;
+    }
+    return false;
 }
 
 void Put16(std::vector<std::uint8_t>& bytes, std::size_t at, std::uint32_t value) {
@@ -175,11 +187,44 @@ void TruncatedReferences() {
 
 }
 
+void RefusedOutputs() {
+    const Fork fork = MakeFork(0, false);
+    Session session(fork.bytes);
+    std::int64_t mapOffset = -1;
+    std::int64_t rdataPos = -1;
+    errno = 71;
+    Require(Throws([&] { FT_Raccess_Get_HeaderInfo_nid_postfix(&session.library, &session.stream, 0, &mapOffset, reinterpret_cast<std::int64_t*>(0x10)); }), "an unreadable data position refuses the header info");
+    Require(errno == 71, "an unreadable data position keeps the caller errno");
+    Require(Throws([&] { FT_Raccess_Get_HeaderInfo_nid_postfix(&session.library, &session.stream, 0, reinterpret_cast<std::int64_t*>(0x10), &rdataPos); }), "an unreadable map position refuses the header info");
+    Require(rdataPos == 0x100, "the data position is published before the refused map position");
+
+    std::int64_t* offsets = nullptr;
+    std::int64_t count = 0;
+    errno = 71;
+    Require(Throws([&] { FT_Raccess_Get_DataOffsets_nid_postfix(reinterpret_cast<GuestRaccessLibrary*>(0x10), &session.stream, 0x140 + 28, 0x100, Post, &offsets, &count); }), "an unreadable raccess library refuses the data offsets");
+    Require(errno == 71, "an unreadable raccess library keeps the caller errno");
+    Require(Throws([&] { FT_Raccess_Get_DataOffsets_nid_postfix(&session.library, &session.stream, 0x140 + 28, 0x100, Post, &offsets, reinterpret_cast<std::int64_t*>(0x10)); }), "an unreadable count refuses the data offsets");
+    offsets = nullptr;
+    Require(Throws([&] { FT_Raccess_Get_DataOffsets_nid_postfix(&session.library, &session.stream, 0x140 + 28, 0x100, Post, reinterpret_cast<std::int64_t**>(0x10), &count); }), "an unreadable offsets output refuses the data offsets");
+    Require(count == 3 && !offsets, "the count is published before the refused offsets pointer");
+
+    char* names[9] = {};
+    std::int64_t guessOffsets[9] = {};
+    std::int32_t guessErrors[9] = {};
+    errno = 71;
+    Require(Throws([&] { FT_Raccess_Guess_nid_postfix(reinterpret_cast<GuestRaccessLibrary*>(0x10), &session.stream, const_cast<char*>(reinterpret_cast<const char*>(fork.bytes.data())), names, guessOffsets, guessErrors); }), "an unreadable raccess library refuses the guess");
+    Require(errno == 71, "an unreadable raccess library keeps the caller errno in the guess");
+    Require(Throws([&] { FT_Raccess_Guess_nid_postfix(&session.library, &session.stream, const_cast<char*>(reinterpret_cast<const char*>(fork.bytes.data())), reinterpret_cast<char**>(0x10), guessOffsets, guessErrors); }), "an unreadable names array refuses the guess");
+    Require(Throws([&] { FT_Raccess_Guess_nid_postfix(&session.library, &session.stream, const_cast<char*>(reinterpret_cast<const char*>(fork.bytes.data())), names, reinterpret_cast<std::int64_t*>(0x10), guessErrors); }), "an unreadable offsets array refuses the guess");
+    Require(Throws([&] { FT_Raccess_Guess_nid_postfix(&session.library, &session.stream, const_cast<char*>(reinterpret_cast<const char*>(fork.bytes.data())), names, guessOffsets, reinterpret_cast<std::int32_t*>(0x10)); }), "an unreadable errors array refuses the guess");
+}
+
 int main() {
     HeaderAndOffsets(0, false);
     HeaderAndOffsets(0x80, true);
     RejectedHeaders();
     TruncatedReferences();
+    RefusedOutputs();
     std::puts("Guest FreeType Ot raccess tests passed");
     return 0;
 }

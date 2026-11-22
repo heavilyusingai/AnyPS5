@@ -1,4 +1,5 @@
 #include "prx/libSceVideoOut/include/Output.hpp"
+#include "prx/libSceVideoOut/include/VideoOut.hpp"
 #include "SceTypes.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "tests/VideoOutTestEnvironment.hpp"
@@ -10,6 +11,7 @@ static constexpr int SYSTEM_USER = 255;
 static constexpr int MAIN_BUS = 0;
 static constexpr int NEVER_OPENED_HANDLE = 2;
 static constexpr int VIDEO_OUT_ERROR_INVALID_VALUE = static_cast<int>(0x80290001u);
+static constexpr int VIDEO_OUT_ERROR_INVALID_ADDRESS = static_cast<int>(0x80290002u);
 
 static void Require(bool value) { if (!value) std::abort(); }
 
@@ -43,6 +45,12 @@ int main() {
     Require(handle > 0);
 
     Require(sceVideoOutSetFlipRate(handle, 0) == 0);
+    Require(sceVideoOutGetFlipStatus(handle, reinterpret_cast<VideoOutFlipStatus*>(std::uintptr_t{0x10})) == VIDEO_OUT_ERROR_INVALID_ADDRESS);
+    Require(sceVideoOutGetVblankStatus(handle, reinterpret_cast<VideoOutVblankStatus*>(std::uintptr_t{0x10})) == VIDEO_OUT_ERROR_INVALID_ADDRESS);
+    Require(sceVideoOutGetOutputStatus(handle, reinterpret_cast<VideoOutOutputStatus*>(std::uintptr_t{0x10})) == VIDEO_OUT_ERROR_INVALID_ADDRESS);
+    Require(sceVideoOutGetOutputStatusWithVrr(handle, reinterpret_cast<void*>(std::uintptr_t{0x10})) == VIDEO_OUT_ERROR_INVALID_ADDRESS);
+    Require(sceVideoOutGetResolutionStatus(handle, reinterpret_cast<VideoOutResolutionStatus*>(std::uintptr_t{0x10})) == VIDEO_OUT_ERROR_INVALID_ADDRESS);
+    Require(sceVideoOutGetDeviceCapabilityInfo_(handle, reinterpret_cast<void*>(std::uintptr_t{0x10}), sizeof(std::uint64_t)) == VIDEO_OUT_ERROR_INVALID_VALUE);
     Require(sceVideoOutSetFlipRate(handle, 1) == 0);
     Require(sceVideoOutSetFlipRate(handle, 2) == 0);
     Require(sceVideoOutSetFlipRate(handle, 1) == 0);

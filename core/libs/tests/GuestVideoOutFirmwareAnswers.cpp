@@ -1,6 +1,8 @@
 #include "prx/libSceVideoOut/include/InventoryExports.hpp"
+#include "prx/libSceVideoOut/include/LaterExports.hpp"
 #include <array>
 #include <cstddef>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -84,7 +86,49 @@ static void CheckIsModeS3d() {
     }
 }
 
+static void CheckContentSetters() {
+    constexpr int invalidAddress = static_cast<int>(0x80290002u);
+    constexpr int invalidValue = static_cast<int>(0x80290001u);
+    for (bool setType : {false, true}) {
+        const auto set = setType ? sceVideoOutSetContentType : sceVideoOutSetContentDynamicRange;
+        const unsigned maximum = setType ? 4 : 1;
+        Require(set(~0u, nullptr) == invalidAddress, "null record must take precedence over an invalid argument");
+        std::array<std::uint8_t, 65> storage{};
+        auto* record = storage.data() + 1;
+        storage[0] = 0xa5;
+        record[0] = 0x1c;
+        record[2] = 0xff;
+        record[3] = 2;
+        record[4] = 1;
+        record[5] = record[7] = record[12] = record[15] = 0x5a;
+        record[8] = 15;
+        const auto original = storage;
+        for (unsigned value = 0; value <= maximum + 1; ++value) {
+            storage = original;
+            auto expected = original;
+            if (value <= maximum) expected[1 + (setType ? 2 : 4)] = static_cast<std::uint8_t>(value);
+            Require(set(value, record) == (value <= maximum ? 0 : invalidValue) && storage == expected,
+                    "content setter changed the wrong bytes or returned the wrong result");
+        }
+        for (unsigned offset = 0; offset < 64; ++offset) {
+            if ((offset >= 5 && offset <= 7) || (offset >= 12 && offset <= 15)) continue;
+            storage = original;
+            record[offset] = 0xfe;
+            const auto invalid = storage;
+            Require(set(0, record) == invalidValue && storage == invalid, "invalid input record was modified or accepted");
+        }
+    }
+}
+
 int main() {
+    errno = 71;
+    sceVideoOutSysInitMode(reinterpret_cast<void*>(std::uintptr_t{0x10}));
+    Require(errno == 71, "SysInitMode keeps the caller errno on an unwritable mode");
+    Require(sceVideoOutSysIsModeS3d(reinterpret_cast<const void*>(std::uintptr_t{0x10})) == 0, "SysIsModeS3d reports no s3d for an unreadable mode");
+    Require(errno == 71, "SysIsModeS3d keeps the caller errno");
+    Require(sceVideoOutSysModeIsHdr(reinterpret_cast<const void*>(std::uintptr_t{0x10})) == 0, "SysModeIsHdr reports no hdr for an unreadable mode");
+    Require(errno == 71, "SysModeIsHdr keeps the caller errno");
+
     Require(sceVideoOutAddBufferHdrPrivilege() == 0, "sceVideoOutAddBufferHdrPrivilege did not return 0");
     Require(sceVideoOutRazorRecallCallbacks() == 0, "sceVideoOutRazorRecallCallbacks did not return 0");
     Require(sceVideoOutSysUpdateRenderingMode() == 0, "sceVideoOutSysUpdateRenderingMode did not return 0");
@@ -95,6 +139,7 @@ int main() {
     Require(ModeIsVr(0xFFFFFFFFu, 0xFF) == 1, "a mode with every bit set did not report VR");
     Require(ModeIsVr(0xFFFFFFFDu, 0xFF) == 0, "the other bits of the dword at 0x20 reported VR");
     Require(ModeIsVr(0u, 0xFF) == 0, "bytes outside the dword at 0x20 reported VR");
+    CheckContentSetters();
     CheckInitMode();
     CheckModeFlags();
     CheckModeIsHdr();
